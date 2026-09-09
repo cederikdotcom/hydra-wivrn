@@ -9,6 +9,7 @@
 		{
 			"name": "base",
 			"hidden": true,
+			"generator": "Ninja",
 			"cacheVariables": {
 				"CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
 				"CMAKE_INTERPROCEDURAL_OPTIMIZATION": "ON",
@@ -25,7 +26,6 @@
 				"WIVRN_USE_NVENC": "ON",
 				"WIVRN_USE_SYSTEMD": "ON",
 				"WIVRN_USE_SYSTEM_BOOST": "ON",
-				"WIVRN_USE_PULSEAUDIO": "ON",
 				"WIVRN_USE_PIPEWIRE": "ON",
 				"WIVRN_WERROR": "ON"
 			}
@@ -66,6 +66,24 @@
 			}
 		},
 		{
+			"name": "server-tracing",
+			"displayName": "Server with Perfetto tracing",
+			"inherits": "server",
+			"binaryDir": "${sourceDir}/build-server-tracing",
+			"cacheVariables": {
+				"WIVRN_USE_PERFETTO": "ON"
+			}
+		},
+		{
+			"name": "server-tracing-monado",
+			"displayName": "Server with Perfetto tracing (incl. Monado)",
+			"inherits": "server-tracing",
+			"binaryDir": "${sourceDir}/build-server-tracing-monado",
+			"cacheVariables": {
+				"WIVRN_TRACE_MONADO": "ON"
+			}
+		},
+		{
 			"name": "dashboard",
 			"displayName": "Dashboard only",
 			"inherits": "base",
@@ -90,6 +108,7 @@
 			"inherits": "everything",
 			"binaryDir": "${sourceDir}/build-no-systemd",
 			"cacheVariables": {
+				"WIVRN_BUILD_WIVRNCTL": "OFF",
 				"WIVRN_USE_SYSTEMD": "OFF"
 			}
 		},
@@ -108,7 +127,17 @@
 			"inherits": "server",
 			"binaryDir": "${sourceDir}/build-server-no-systemd",
 			"cacheVariables": {
+				"WIVRN_BUILD_WIVRNCTL": "OFF",
 				"WIVRN_USE_SYSTEMD": "OFF"
+			}
+		},
+		{
+			"name": "client-no-system-boost",
+			"displayName": "Client only (no system Boost)",
+			"inherits": "client",
+			"binaryDir": "${sourceDir}/build-client-no-system-boost",
+			"cacheVariables": {
+				"WIVRN_USE_SYSTEM_BOOST": "OFF"
 			}
 		},
 		{

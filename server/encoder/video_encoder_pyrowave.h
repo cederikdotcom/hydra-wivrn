@@ -19,6 +19,7 @@
 #pragma once
 
 #include "video_encoder.h"
+#include "vk/allocation.h"
 
 #include "pyrowave_encoder.h"
 
@@ -29,23 +30,32 @@ namespace wivrn
 {
 class video_encoder_pyrowave : public video_encoder
 {
+	vk_bundle & vk;
 	PyroWave::Encoder enc;
+	vk::raii::CommandPool cmd_pool;
+
+	struct in_t
+	{
+		vk::raii::Fence fence = nullptr;
+		vk::raii::CommandBuffer cmd = nullptr;
+		buffer_allocation meta_buf, data_buf;
+		buffer_allocation meta_buf_staging, data_buf_staging;
+	};
+	std::array<in_t, num_slots> in;
+
 	std::unordered_map<VkImage, std::array<vk::raii::ImageView, 3>> image_views; // for input images
-	vk::ImageViewCreateInfo image_view_template;
-	buffer_allocation data_buf, meta_buf;
-	buffer_allocation data_buf_staging, meta_buf_staging;
+	size_t meta_size;
+	float fps;
 	size_t encoded_size;
 
 	std::vector<uint8_t> reordered_packet_buffer;
 	std::vector<PyroWave::Encoder::Packet> packets;
 
 public:
-	video_encoder_pyrowave(wivrn_vk_bundle & vk, encoder_settings & settings, float fps, uint8_t stream_idx);
+	video_encoder_pyrowave(wivrn::vk_bundle & vk, const encoder_settings & settings, uint8_t stream_idx);
 
-	std::pair<bool, vk::Semaphore> present_image(vk::Image y_cbcr, vk::raii::CommandBuffer & cmd_buf, uint8_t slot, uint64_t frame_index) override;
+	void present_image(vk::Image y_cbcr, vk::SemaphoreSubmitInfo info, uint8_t slot, uint64_t frame_index) override;
 
-	std::optional<data> encode(bool idr, std::chrono::steady_clock::time_point pts, uint8_t slot) override;
-
-	~video_encoder_pyrowave();
+	std::optional<data> encode(uint8_t slot, uint64_t frame_index) override;
 };
 } // namespace wivrn

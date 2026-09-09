@@ -19,6 +19,8 @@
 
 #pragma once
 
+#include "hostname.h"
+#include "wivrn_config.h"
 #include <array>
 #include <chrono>
 #include <filesystem>
@@ -44,26 +46,23 @@ struct configuration
 	struct encoder
 	{
 		std::string name;
-		std::optional<double> width;
-		std::optional<double> height;
-		std::optional<double> offset_x;
-		std::optional<double> offset_y;
-		std::optional<int> group;
 		std::optional<wivrn::video_codec> codec;
 		std::map<std::string, std::string> options;
 		std::optional<std::string> device;
 	};
 
-	std::vector<encoder> encoders;
-	std::optional<encoder> encoder_passthrough;
-	std::optional<int> bitrate;
-	int bit_depth = 8;
-	std::optional<std::array<double, 2>> scale;
+	std::array<encoder, 3> encoders; // left, right, alpha
+	std::optional<uint8_t> bit_depth;
 	std::optional<std::array<float, 3>> grip_surface;
 	std::vector<std::string> application;
 	bool debug_gui = false;
 	bool use_steamvr_lh = false;
+	std::optional<int64_t> lh_max_extrapolation;
+	std::optional<float> lh_stick_deadzone;
+	bool hid_forwarding = false;
 	bool tcp_only = false;
+	int port = wivrn::default_port;
+	std::string hostname = wivrn::hostname();
 	service_publication publication = service_publication::avahi;
 
 	// monostate: default value, string: user defined, nullptr: disabled

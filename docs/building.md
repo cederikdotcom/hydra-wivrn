@@ -2,18 +2,6 @@
 
 # Server (PC)
 
-## Dependencies
-
-WiVRn requires avahi-client, eigen3, gettext, libpulse, libsystemd, nlohmann_json, librsvg2.
-
-It also requires at least one encoder:
-
- * For nvenc (Nvidia), it requires cuda and nvidia driver
- * For vaapi (AMD/Intel), it requires ffmpeg with vaapi and libdrm support, as well as vaapi drivers for the GPU
- * For x264 (software encoding), it requires libx264
-
-Some distributions such as Fedora don't ship h264 and h265 encoders and need specific repositories.
-
 ## Compile
 
 From your checkout directory, with automatic detection of encoders
@@ -22,18 +10,17 @@ cmake -B build-server . -GNinja -DWIVRN_BUILD_CLIENT=OFF -DCMAKE_BUILD_TYPE=RelW
 cmake --build build-server
 ```
 
-It is possible to force specific encoders, by adding options
+It is possible to disable specific encoders, by adding options
 ```
--DWIVRN_USE_NVENC=ON
--DWIVRN_USE_VAAPI=ON
--DWIVRN_USE_VULKAN_ENCODE=ON
--DWIVRN_USE_X264=ON
+-DWIVRN_USE_NVENC=OFF
+-DWIVRN_USE_VAAPI=OFF
+-DWIVRN_USE_VULKAN_ENCODE=OFF
+-DWIVRN_USE_X264=OFF
 ```
 
 Force specific audio backends
 ```
 -DWIVRN_USE_PIPEWIRE=ON
--DWIVRN_USE_PULSEAUDIO=ON
 ```
 
 Systemd service and pretty hostname support
@@ -41,7 +28,27 @@ Systemd service and pretty hostname support
 -DWIVRN_USE_SYSTEMD=ON
 ```
 
+Lighthouse driver support for use with lighthouse-tracked devices
+```
+-DWIVRN_FEATURE_STEAMVR_LIGHTHOUSE=ON
+```
+
 Additionally, if your environment requires absolute paths inside the OpenXR runtime manifest, you can add `-DWIVRN_OPENXR_MANIFEST_TYPE=absolute` to the build configuration.
+
+## Profiling / tracing build
+
+To build the server with Perfetto tracing for local profiling, use the `server-tracing` preset (it is the `server` preset plus `WIVRN_USE_PERFETTO=ON`):
+
+```bash
+cmake --preset server-tracing
+cmake --build build-server-tracing
+```
+
+This requires the Perfetto amalgamated SDK installed where CMake looks for it (`/usr/share/perfetto/sdk/perfetto.{h,cc}`, override with `-DPERFETTO_SDK_DIR=<dir>`). Tracing is gated at runtime by the `WIVRN_TRACING` env var, so a tracing-enabled build has no cost until you set it.
+
+To also instrument Monado under the same switch, use the `server-tracing-monado` preset (adds `WIVRN_TRACE_MONADO=ON`); this requires [percetto](https://github.com/olvaffe/percetto/) to be discoverable at configure time.
+
+See [profiling](profiling.md) for how to run the server with tracing and capture/analyse traces.
 
 # Dashboard
 
@@ -60,7 +67,7 @@ See [Server](#server-pc) for the server compile options.
 # Client (headset)
 
 #### Build dependencies
-As Arch package names: git pkgconf glslang cmake jdk17-openjdk librsvg cli11 ktx_software-git ([AUR](https://aur.archlinux.org/packages/ktx_software-git))
+As Arch package names: git pkgconf glslang cmake jdk17-openjdk librsvg cli11 ktx-software-bin ([AUR](https://aur.archlinux.org/packages/ktx-software-bin))
 
 OpenSSL build dependencies are also needed, as described [here](https://github.com/openssl/openssl/blob/master/INSTALL.md#prerequisites), in particular perl 5.
 
@@ -75,7 +82,7 @@ sdkmanager --sdk_root="${HOME}/Android" --licenses
 
 Install the correct cmake version with
 ```bash
-sdkmanager --install "cmake;3.30.3"
+sdkmanager --install "cmake;3.31.5"
 ```
 
 #### Apk signing
@@ -95,10 +102,10 @@ From the main directory.
 export ANDROID_HOME=~/Android
 export JAVA_HOME=/usr/lib/jvm/java-17-openjdk/
 
-./gradlew assembleStandardRelease
+./gradlew assembleRelease
 ```
 
-Outputs will be in `build/outputs/apk/standard/release/WiVRn-standard-release.apk`
+Outputs will be in `build/outputs/apk/release/WiVRn-release.apk`
 
 #### Install apk with adb
 Before using adb you must enable usb debugging on your device:
@@ -116,7 +123,7 @@ adb start-server
 adb devices
 
 # Install apk
-adb install build/outputs/apk/standard/release/WiVRn-standard-release.apk
+adb install build/outputs/apk/release/WiVRn-release.apk
 
 # When you're done, you can stop the adb server
 adb kill-server

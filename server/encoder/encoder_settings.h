@@ -24,27 +24,29 @@
 #include <map>
 #include <optional>
 #include <string>
-#include <vector>
 
 namespace wivrn
 {
-struct wivrn_vk_bundle;
+struct vk_bundle;
+class wivrn_session;
 
-struct encoder_settings : public to_headset::video_stream_description::item
+struct encoder_settings
 {
+	uint16_t width;
+	uint16_t height;
+	video_codec codec; // left, right, alpha
+	float fps;
 	// encoder identifier, such as nvenc, vaapi or x264
 	std::string encoder_name;
 	uint64_t bitrate;                           // bit/s
 	double bitrate_multiplier;                  // encoder bitrate / global bitrate
 	std::map<std::string, std::string> options; // additional encoder-specific configuration
-	// encoders in the same group are executed in sequence
-	int group = 0;
 	int bit_depth;
 	std::optional<std::string> device;
 };
 
-std::vector<encoder_settings> get_encoder_settings(wivrn_vk_bundle &, uint32_t & width, uint32_t & height, const from_headset::headset_info_packet & info);
+std::array<encoder_settings, 3> get_encoder_settings(wivrn::vk_bundle &, wivrn_session &);
 
-void print_encoders(const std::vector<wivrn::encoder_settings> & encoders);
+void print_encoders(const std::array<wivrn::encoder_settings, 3> & encoders);
 
 } // namespace wivrn

@@ -18,7 +18,10 @@
 
 #pragma once
 
+#include "image_loader.h"
 #include "render/growable_descriptor_pool.h"
+#include "utils/cache.h"
+#include "utils/mapped_file.h"
 #include "utils/thread_safe.h"
 #include "wivrn_config.h"
 #include "xr/hand_tracker.h"
@@ -28,6 +31,7 @@
 #include <glm/gtc/quaternion.hpp>
 #include <imgui.h>
 #include <implot.h>
+#include <inplace_vector.hpp>
 #include <optional>
 #include <span>
 #include <unordered_map>
@@ -36,19 +40,47 @@
 #include <vulkan/vulkan_raii.hpp>
 #include <openxr/openxr.h>
 
-class imgui_context
+class imgui_textures
+{
+	struct texture_data
+	{
+		std::shared_ptr<loaded_image> image;
+		std::shared_ptr<vk::raii::DescriptorSet> descriptor_set;
+	};
+
+protected:
+	vk::raii::PhysicalDevice physical_device;
+	vk::raii::Device & device;
+	thread_safe<vk::raii::Queue> & queue;
+	vk::raii::DescriptorSetLayout ds_layout;
+	vk::raii::CommandPool command_pool;
+
+	using image_cache_type = utils::cache<std::string, loaded_image, image_loader>;
+	std::shared_ptr<image_cache_type> image_cache;
+
+private:
+	growable_descriptor_pool descriptor_pool;
+	std::unordered_map<ImTextureID, texture_data> textures;
+
+public:
+	imgui_textures(
+	        vk::raii::PhysicalDevice physical_device,
+	        vk::raii::Device & device,
+	        uint32_t queue_family_index,
+	        thread_safe<vk::raii::Queue> & queue,
+	        std::shared_ptr<image_cache_type> image_cache = {});
+	~imgui_textures();
+	ImTextureID load_texture(const std::string & filename);
+	ImTextureID load_texture(const std::span<const std::byte> & bytes, const std::string & name = "");
+	void free_texture(ImTextureID);
+};
+
+class imgui_context : public imgui_textures
 {
 	struct command_buffer
 	{
 		vk::raii::CommandBuffer command_buffer = nullptr;
 		vk::raii::Fence fence = nullptr;
-	};
-
-	struct texture_data
-	{
-		vk::raii::Sampler sampler;
-		std::shared_ptr<vk::raii::ImageView> image_view;
-		std::shared_ptr<vk::raii::DescriptorSet> descriptor_set;
 	};
 
 public:
@@ -76,8 +108,6 @@ public:
 
 	struct controller_state
 	{
-		bool active = false;
-
 		glm::vec3 aim_position = {0, 0, 0};
 		glm::quat aim_orientation = {1, 0, 0, 0};
 
@@ -85,11 +115,10 @@ public:
 		glm::vec2 scroll_value = {0, 0};
 
 		std::optional<ImVec2> pointer_position;
-		float hover_distance = 1e10;
+		// float hover_distance = 1e10;
 
 		bool squeeze_clicked = false;
 		bool trigger_clicked = false;
-		bool fingertip_hovering = false;
 		bool fingertip_touching = false;
 		ImGuiMouseSource source = ImGuiMouseSource_Mouse;
 	};
@@ -107,6 +136,7 @@ public:
 		glm::ivec2 vp_size;
 
 		bool always_show_cursor = false; // Show the cursor in this viewport even if there is a modal popup elsewhere (eg. this is a virtual keyboard)
+		bool tooltip_viewport = false;   // Choose this viewport to display the tooltip, ignore mouse events
 
 		int z_index = 0;
 
@@ -116,19 +146,20 @@ public:
 		}
 	};
 
+	struct window_viewport
+	{
+		// Position of this window in the world
+		xr::spaces space;
+		glm::vec3 position;
+		glm::quat orientation;
+		glm::vec2 size;
+	};
+
 private:
-	vk::raii::PhysicalDevice physical_device;
-	vk::raii::Device & device;
 	uint32_t queue_family_index;
-	thread_safe<vk::raii::Queue> & queue;
 
 	vk::raii::Pipeline pipeline = nullptr;
-	vk::raii::DescriptorSetLayout ds_layout;
-	growable_descriptor_pool descriptor_pool;
 	vk::raii::RenderPass renderpass;
-	vk::raii::CommandPool command_pool;
-
-	std::unordered_map<ImTextureID, texture_data> textures;
 
 	std::vector<imgui_frame> frames;
 	imgui_frame & get_frame(vk::Image destination);
@@ -146,7 +177,7 @@ private:
 
 	std::vector<viewport> layers_;
 
-	xr::swapchain & swapchain;
+	xr::swapchain swapchain;
 	int image_index;
 
 	ImGuiContext * context;
@@ -162,6 +193,8 @@ private:
 	bool button_pressed = false;
 	bool fingertip_touching = false;
 
+	std::array<float, 2> aim_interaction = {1, 1}; // left, right, floating point to fade the cursor position between poking and hand interaction
+
 	ImGuiID hovered_item = 0;      // Hovered item in the current frame, reset at the beginning of the frame
 	ImGuiID hovered_item_prev = 0; // Hovered item at the previous frame
 
@@ -169,6 +202,7 @@ private:
 	bool show_demo_window = true;
 #endif
 
+	beman::inplace_vector::inplace_vector<utils::mapped_file, 3> font_awesome;
 	void initialize_fonts();
 
 	std::vector<controller_state> read_controllers_state(XrTime display_time);
@@ -181,8 +215,9 @@ public:
 	        uint32_t queue_family_index,
 	        thread_safe<vk::raii::Queue> & queue,
 	        std::span<controller> controllers,
-	        xr::swapchain & swapchain,
-	        std::vector<viewport> layers);
+	        xr::swapchain && swapchain,
+	        std::vector<viewport> layers,
+	        std::shared_ptr<imgui_textures::image_cache_type> image_cache);
 
 	~imgui_context();
 
@@ -190,6 +225,11 @@ public:
 	{
 		return layers_;
 	}
+
+	// place a satellite layer at base orientation (optionally post-rotated), offset in the base's local frame
+	void place_layer_relative(size_t layer, size_t base, glm::vec3 offset, glm::quat extra_rotation = glm::quat(1, 0, 0, 0));
+
+	std::vector<window_viewport> windows();
 
 	viewport & layer(ImVec2 position);
 
@@ -202,22 +242,26 @@ public:
 	}
 
 	std::vector<std::pair<ImVec2, float>> ray_plane_intersection(const controller_state & in) const;
-	void compute_pointer_position(controller_state & state);
+	[[nodiscard]] std::pair<std::optional<ImVec2>, float> compute_pointer_position(const controller_state & state) const;
 
 	// Convert position from viewport coordinates to real-world
 	glm::vec3 rw_from_vp(const ImVec2 & position);
 
-	ImTextureID load_texture(const std::string & filename, vk::raii::Sampler && sampler);
-	ImTextureID load_texture(const std::string & filename);
-	ImTextureID load_texture(const std::span<const std::byte> & bytes, vk::raii::Sampler && sampler);
-	ImTextureID load_texture(const std::span<const std::byte> & bytes);
-	void free_texture(ImTextureID);
 	void set_current();
-
-	bool is_modal_popup_shown() const;
 
 	void vibrate_on_hover();
 	void set_hovered_item();
 	void set_controllers_enabled(bool value);
-	void tooltip(std::string_view text);
+	// anchor, if set, positions the tooltip above that display point instead of above the last item's rect
+	void tooltip(std::string_view text, std::optional<ImVec2> anchor = std::nullopt);
+	std::array<bool, 2> is_aim_interaction() const
+	{
+		return {aim_interaction[0] == 1, aim_interaction[1] == 1};
+	}
 };
+
+void ScrollWhenDragging();
+
+void CenterTextH(const std::string & text);
+
+void CenterTextHV(const std::string & text);

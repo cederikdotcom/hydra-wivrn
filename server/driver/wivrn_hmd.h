@@ -20,27 +20,30 @@
 #pragma once
 
 #include "utils/thread_safe.h"
+#include "xrt/xrt_compositor.h"
 #include "xrt/xrt_device.h"
 #include "xrt/xrt_tracking.h"
+
+#include <inplace_vector.hpp>
 
 #include "view_list.h"
 
 #include <array>
 #include <cstdint>
-#include <mutex>
 
 namespace wivrn
 {
 class wivrn_session;
 
+struct wivrn_hmd_presence_data
+{
+	bool value;
+	int64_t change_time;
+};
+
 class wivrn_hmd : public xrt_device
 {
-	std::mutex mutex;
-
-	xrt_input pose_input{
-	        .active = true,
-	        .name = XRT_INPUT_GENERIC_HEAD_POSE,
-	};
+	beman::inplace_vector::inplace_vector<xrt_input, 2> inputs_array;
 	xrt_hmd_parts hmd_parts{};
 	xrt_tracking_origin tracking_origin{
 	        .name = "WiVRn origin",
@@ -51,13 +54,9 @@ class wivrn_hmd : public xrt_device
 	};
 
 	view_list views;
-	from_headset::battery battery{};
+	thread_safe<from_headset::battery> battery{};
 
-	std::atomic<bool> presence{true};
-	// last XR_EVENT_DATA_USER_PRESENCE_CHANGED_EXT from headset
-	// we must keep track of this to not go out of sync with headset when
-	// a session state change also triggers presence change
-	std::atomic<bool> real_presence{true};
+	thread_safe<wivrn_hmd_presence_data> presence;
 	thread_safe<std::array<std::optional<from_headset::visibility_mask_changed::masks>, 2>> visibility_mask;
 
 	wivrn::wivrn_session * cnx;
@@ -65,16 +64,17 @@ class wivrn_hmd : public xrt_device
 	xrt_result_t get_visibility_mask(xrt_visibility_mask_type, uint32_t view_index, xrt_visibility_mask **);
 
 public:
-	using base = xrt_device;
+	using base_t = xrt_device;
 	wivrn_hmd(wivrn::wivrn_session * cnx,
 	          const from_headset::headset_info_packet & info);
 
 	void set_foveated_size(uint32_t width, uint32_t height);
 
+	xrt_result_t update_inputs();
 	xrt_result_t get_tracked_pose(xrt_input_name name, int64_t at_timestamp_ns, xrt_space_relation *);
-	xrt_result_t get_presence(bool * out_presence);
 	xrt_result_t get_view_poses(const xrt_vec3 * default_eye_relation,
 	                            int64_t at_timestamp_ns,
+	                            xrt_view_type view_type,
 	                            uint32_t view_count,
 	                            xrt_space_relation * out_head_relation,
 	                            xrt_fov * out_fovs,
@@ -86,7 +86,6 @@ public:
 	void update_battery(const from_headset::battery &);
 	void update_tracking(const from_headset::tracking &, const clock_offset &);
 	void update_visibility_mask(const from_headset::visibility_mask_changed &);
-	// real if this update comes from a presence changed event
-	bool update_presence(bool new_presence, bool real);
+	void update_presence(bool new_presence, int64_t timestamp);
 };
 } // namespace wivrn

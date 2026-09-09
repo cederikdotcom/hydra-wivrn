@@ -19,6 +19,7 @@
 
 #pragma once
 
+#include "utils/gpu_timestamp_pool.h"
 #include "video_encoder.h"
 #include "video_encoder_nvenc_shared_state.h"
 #include <array>
@@ -33,32 +34,41 @@ namespace wivrn
 class video_encoder_nvenc : public video_encoder
 {
 private:
-	wivrn_vk_bundle & vk;
-	// relevant part of the input image to encode
-	vk::Rect2D rect;
+	wivrn::vk_bundle & vk;
+	vk::raii::CommandPool cmd_pool;
 
 	std::shared_ptr<video_encoder_nvenc_shared_state> shared_state;
 
 	void * session_handle = nullptr;
-	NV_ENC_OUTPUT_PTR bitstreamBuffer;
+	NV_ENC_OUTPUT_PTR outputBuffer;
+	NV_ENC_CONFIG config;
+	NV_ENC_INITIALIZE_PARAMS init_params;
 
 	struct in_t
 	{
+		vk::raii::Fence fence = nullptr;
+		vk::raii::CommandBuffer cmd = nullptr;
 		vk::raii::Buffer yuv = nullptr;
 		vk::raii::DeviceMemory mem = nullptr;
 		NV_ENC_REGISTERED_PTR nvenc_resource;
 	};
 	std::array<in_t, num_slots> in;
 
+	gpu_timestamp_pool ts_pool;
+
 	float fps;
-	int bitrate;
+	uint64_t bitrate;
+	int bytesPerPixel = 1;
+
+	NV_ENC_RC_PARAMS get_rc_params(uint64_t bitrate, float framerate);
+	void set_init_params_fps(float framerate);
 
 public:
-	video_encoder_nvenc(wivrn_vk_bundle & vk, encoder_settings & settings, float fps, uint8_t stream_idx);
+	video_encoder_nvenc(wivrn::vk_bundle & vk, const encoder_settings & settings, uint8_t stream_idx);
 	~video_encoder_nvenc();
 
-	std::pair<bool, vk::Semaphore> present_image(vk::Image y_cbcr, vk::raii::CommandBuffer & cmd_buf, uint8_t slot, uint64_t frame_index) override;
-	std::optional<data> encode(bool idr, std::chrono::steady_clock::time_point pts, uint8_t slot) override;
+	void present_image(vk::Image y_cbcr, vk::SemaphoreSubmitInfo info, uint8_t slot, uint64_t frame_index) override;
+	std::optional<data> encode(uint8_t slot, uint64_t frame_index) override;
 
 	static std::array<int, 2> get_max_size(video_codec);
 };

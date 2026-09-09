@@ -23,6 +23,7 @@
 #include "utils/thread_safe.h"
 #include "vk/allocation.h"
 #include "wivrn_packets.h"
+#include <atomic>
 #include <memory>
 #include <span>
 #include <thread>
@@ -61,6 +62,8 @@ private:
 	vk::raii::SamplerYcbcrConversion ycbcr_conversion;
 	vk::raii::Sampler sampler_;
 
+	const vk::Extent2D extent;
+
 	std::array<image, image_count> image_pool;
 
 	std::weak_ptr<scenes::stream> weak_scene;
@@ -84,8 +87,7 @@ public:
 	pyrowave_decoder(vk::raii::Device & device,
 	                 vk::raii::PhysicalDevice & physical_device,
 	                 uint32_t vk_queue_family_index,
-	                 const wivrn::to_headset::video_stream_description::item & description,
-	                 float fps,
+	                 const wivrn::to_headset::video_stream_description & description,
 	                 uint8_t stream_index,
 	                 std::weak_ptr<scenes::stream> scene,
 	                 shard_accumulator * accumulator);
@@ -101,14 +103,6 @@ public:
 	vk::Sampler sampler() override
 	{
 		return *sampler_;
-	}
-
-	vk::Extent2D image_size()
-	{
-		return {
-		        description.width,
-		        description.height,
-		};
 	}
 
 	static std::vector<wivrn::video_codec> supported_codecs();

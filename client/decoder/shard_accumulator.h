@@ -79,13 +79,12 @@ public:
 	explicit shard_accumulator(
 	        vk::raii::Device & device,
 	        vk::raii::PhysicalDevice & physical_device,
-	        uint32_t vk_queue_family_index,
 	        xr::instance & instance,
-	        const wivrn::to_headset::video_stream_description::item & description,
-	        float fps,
+	        uint32_t vk_queue_family_index,
+	        const wivrn::to_headset::video_stream_description & description,
 	        std::weak_ptr<scenes::stream> scene,
 	        uint8_t stream_index) :
-	        decoder_(decoder::make(device, physical_device, vk_queue_family_index, description, fps, stream_index, scene, this)),
+	        decoder_(decoder::make(device, physical_device, vk_queue_family_index, description, stream_index, scene, this)),
 	        current(stream_index),
 	        next(stream_index),
 	        weak_scene(scene),
@@ -95,11 +94,6 @@ public:
 	}
 
 	void push_shard(wivrn::to_headset::video_stream_data_shard &&);
-
-	auto & desc() const
-	{
-		return decoder_->description;
-	}
 
 	vk::Sampler sampler()
 	{

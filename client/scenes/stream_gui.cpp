@@ -17,20 +17,25 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-#define IMGUI_DEFINE_MATH_OPERATORS
-
 #include "stream.h"
 
 #include "application.h"
+#include "configuration.h"
 #include "constants.h"
+#include "gui_common.h"
+#include "gui_settings.h"
 #include "imgui.h"
 #include "imgui_internal.h"
 #include "implot.h"
+#include "render/ui_theme.h"
+#include "render/ui_widgets.h"
 #include "utils/i18n.h"
 #include "utils/ranges.h"
-#include <IconsFontAwesome6.h>
+#include <IconsFontAwesome7.h>
 #include <chrono>
 #include <cmath>
+#include <glm/ext.hpp>
+#include <glm/ext/matrix_transform.hpp>
 #include <glm/gtc/matrix_access.hpp>
 #include <limits>
 #include <ranges>
@@ -85,7 +90,7 @@ ImPlotPoint getter(int index, void * data_)
 }
 } // namespace
 
-void scenes::stream::accumulate_metrics(XrTime predicted_display_time, const std::vector<std::shared_ptr<shard_accumulator::blit_handle>> & blit_handles, const gpu_timestamps & timestamps)
+void scenes::stream::accumulate_metrics(XrTime predicted_display_time, const std::array<std::shared_ptr<shard_accumulator::blit_handle>, view_count + 1> & blit_handles, const gpu_timestamps & timestamps)
 {
 	uint64_t rx = network_session->bytes_received();
 	uint64_t tx = network_session->bytes_sent();
@@ -160,69 +165,18 @@ void scenes::stream::accumulate_metrics(XrTime predicted_display_time, const std
 	metrics_offset = (metrics_offset + 1) % global_metrics.size();
 }
 
-// TODO move in separate file, factorize with lobby_gui.cpp
-static bool RadioButtonWithoutCheckBox(const std::string & label, bool active, ImVec2 size_arg)
-{
-	ImGuiWindow * window = ImGui::GetCurrentWindow();
-	if (window->SkipItems)
-		return false;
-
-	ImGuiContext & g = *GImGui;
-	const ImGuiStyle & style = g.Style;
-	const ImGuiID id = window->GetID(label.c_str());
-	const ImVec2 label_size = ImGui::CalcTextSize(label.c_str(), NULL, true);
-
-	const ImVec2 pos = window->DC.CursorPos;
-
-	ImVec2 size = ImGui::CalcItemSize(size_arg, label_size.x + style.FramePadding.x * 2.0f, label_size.y + style.FramePadding.y * 2.0f);
-
-	const ImRect bb(pos, pos + size);
-	ImGui::ItemSize(bb, style.FramePadding.y);
-	if (!ImGui::ItemAdd(bb, id))
-		return false;
-
-	bool hovered, held;
-	bool pressed = ImGui::ButtonBehavior(bb, id, &hovered, &held);
-
-	ImGuiCol_ col;
-	if ((held && hovered) || active)
-		col = ImGuiCol_ButtonActive;
-	else if (hovered)
-		col = ImGuiCol_ButtonHovered;
-	else
-		col = ImGuiCol_Button;
-
-	ImGui::RenderNavHighlight(bb, id);
-	ImGui::RenderFrame(bb.Min, bb.Max, ImGui::GetColorU32(col), true, style.FrameRounding);
-
-	ImVec2 TextAlign{0, 0.5f};
-	ImGui::RenderTextClipped(bb.Min + style.FramePadding, bb.Max - style.FramePadding, label.c_str(), NULL, &label_size, TextAlign, &bb);
-
-	IMGUI_TEST_ENGINE_ITEM_INFO(id, label.c_str(), g.LastItemData.StatusFlags);
-	return pressed;
-}
-
-template <typename T, typename U>
-static bool RadioButtonWithoutCheckBox(const std::string & label, T & v, U v_button, ImVec2 size_arg)
-{
-	const bool pressed = RadioButtonWithoutCheckBox(label, v == v_button, size_arg);
-	if (pressed)
-		v = v_button;
-	return pressed;
-}
-
 void scenes::stream::gui_performance_metrics()
 {
 	const ImGuiStyle & style = ImGui::GetStyle();
+	const wivrn::ui::theme & t = wivrn::ui::current();
 
 	ImVec2 window_size = ImGui::GetWindowSize() - ImVec2(2, 2) * style.WindowPadding;
 
-	static const std::array plots = {
+	const std::array plots = {
 	        // clang-format off
 	        plot(_("CPU time"), {{"",          &global_metric::cpu_time}},     "s"),
 
-	        plot(_("GPU time"), {{_("Reproject"), &global_metric::gpu_time},
-		                     {_("Blit"),      &global_metric::gpu_barrier}},  "s"),
+	        plot(_("GPU time"), {{_("Defoveate"), &global_metric::gpu_time}},  "s"),
 
 	        plot(_("Network"), {{_("Download"),  &global_metric::bandwidth_rx},
 	                            {_("Upload"),    &global_metric::bandwidth_tx}}, "bit/s"),
@@ -239,7 +193,10 @@ void scenes::stream::gui_performance_metrics()
 	        window_size.x / n_cols - style.ItemSpacing.x * (n_cols - 1) / n_cols,
 	        (window_size.y - 2 * ImGui::GetCurrentContext()->FontSize - 2 * style.ItemSpacing.y) / n_rows - style.ItemSpacing.y * (n_rows - 1) / n_rows);
 
-	ImPlot::PushStyleColor(ImPlotCol_PlotBg, IM_COL32(32, 32, 32, 64));
+	ImPlot::PushStyleColor(ImPlotCol_PlotBg, ImVec4{t.background.x, t.background.y, t.background.z, 0.8f});
+	ImPlot::PushStyleColor(ImPlotCol_PlotBorder, t.border);
+	ImPlot::PushStyleColor(ImPlotCol_LegendBg, ImVec4{t.card.x, t.card.y, t.card.z, 0.9f});
+	ImPlot::PushStyleColor(ImPlotCol_InlayText, t.text);
 	ImPlot::PushStyleColor(ImPlotCol_FrameBg, IM_COL32(0, 0, 0, 0));
 	ImPlot::PushStyleColor(ImPlotCol_AxisBg, IM_COL32(0, 0, 0, 0));
 	ImPlot::PushStyleColor(ImPlotCol_AxisBgActive, IM_COL32(0, 0, 0, 0));
@@ -268,22 +225,25 @@ void scenes::stream::gui_performance_metrics()
 			std::string title_with_units = std::string(title) + " [" + prefix + unit + "]";
 			ImPlot::SetupAxes(nullptr, title_with_units.c_str(), ImPlotAxisFlags_NoDecorations, 0);
 			ImPlot::SetupAxesLimits(0, global_metrics.size() - 1, min_v * multiplier, axis_scale[n] * multiplier, ImGuiCond_Always);
-			ImPlot::SetNextLineStyle(color);
-			ImPlot::SetNextFillStyle(color, 0.25);
+			ImPlotSpec spec;
+			spec.LineColor = color;
+			spec.FillColor = color;
+			spec.FillAlpha = 0.25;
+			spec.Flags = ImPlotLineFlags_Shaded;
 
 			for (const auto & [subtitle, data]: subplots)
 			{
 				getter_data gdata{
-				        .data = (uintptr_t) & (global_metrics.data()->*data),
+				        .data = (uintptr_t)&(global_metrics.data()->*data),
 				        .stride = sizeof(global_metric),
 				        .multiplier = multiplier,
 				};
-				ImPlot::PlotLineG(subtitle.c_str(), getter, &gdata, global_metrics.size(), ImPlotLineFlags_Shaded);
+				ImPlot::PlotLineG(subtitle.c_str(), getter, &gdata, global_metrics.size(), spec);
 
 				double x[] = {double(metrics_offset), double(metrics_offset)};
 				double y[] = {0, axis_scale[n] * multiplier};
-				ImPlot::SetNextLineStyle(ImVec4(1, 1, 1, 1));
-				ImPlot::PlotLine("", x, y, 2);
+				spec.LineColor = ImVec4(1, 1, 1, 1);
+				ImPlot::PlotLine("", x, y, 2, spec);
 			}
 			ImPlot::EndPlot();
 		}
@@ -311,57 +271,57 @@ void scenes::stream::gui_performance_metrics()
 			ImPlot::SetupAxesLimits(0, metrics.size() - 1, min_v * 1e3f, axis_scale[n] * 1e3f, ImGuiCond_Always);
 
 			getter_data getter_encode_begin{
-			        .data = (uintptr_t) & (metrics.data()->encode_begin),
+			        .data = (uintptr_t)&(metrics.data()->encode_begin),
 			        .stride = sizeof(decoder_metric),
 			        .multiplier = 1e3f};
 
 			getter_data getter_encode_end{
-			        .data = (uintptr_t) & (metrics.data()->encode_end),
+			        .data = (uintptr_t)&(metrics.data()->encode_end),
 			        .stride = sizeof(decoder_metric),
 			        .multiplier = 1e3f};
 
 			getter_data getter_send_begin{
-			        .data = (uintptr_t) & (metrics.data()->send_begin),
+			        .data = (uintptr_t)&(metrics.data()->send_begin),
 			        .stride = sizeof(decoder_metric),
 			        .multiplier = 1e3f};
 
 			getter_data getter_send_end{
-			        .data = (uintptr_t) & (metrics.data()->send_end),
+			        .data = (uintptr_t)&(metrics.data()->send_end),
 			        .stride = sizeof(decoder_metric),
 			        .multiplier = 1e3f};
 
 			getter_data getter_received_first_packet{
-			        .data = (uintptr_t) & (metrics.data()->received_first_packet),
+			        .data = (uintptr_t)&(metrics.data()->received_first_packet),
 			        .stride = sizeof(decoder_metric),
 			        .multiplier = 1e3f};
 
 			getter_data getter_received_last_packet{
-			        .data = (uintptr_t) & (metrics.data()->received_last_packet),
+			        .data = (uintptr_t)&(metrics.data()->received_last_packet),
 			        .stride = sizeof(decoder_metric),
 			        .multiplier = 1e3f};
 
 			getter_data getter_sent_to_decoder{
-			        .data = (uintptr_t) & (metrics.data()->sent_to_decoder),
+			        .data = (uintptr_t)&(metrics.data()->sent_to_decoder),
 			        .stride = sizeof(decoder_metric),
 			        .multiplier = 1e3f};
 
 			getter_data getter_received_from_decoder{
-			        .data = (uintptr_t) & (metrics.data()->received_from_decoder),
+			        .data = (uintptr_t)&(metrics.data()->received_from_decoder),
 			        .stride = sizeof(decoder_metric),
 			        .multiplier = 1e3f};
 
 			getter_data getter_blitted{
-			        .data = (uintptr_t) & (metrics.data()->blitted),
+			        .data = (uintptr_t)&(metrics.data()->blitted),
 			        .stride = sizeof(decoder_metric),
 			        .multiplier = 1e3f};
 
 			getter_data getter_displayed{
-			        .data = (uintptr_t) & (metrics.data()->displayed),
+			        .data = (uintptr_t)&(metrics.data()->displayed),
 			        .stride = sizeof(decoder_metric),
 			        .multiplier = 1e3f};
 
 			getter_data getter_predicted{
-			        .data = (uintptr_t) & (metrics.data()->predicted_display),
+			        .data = (uintptr_t)&(metrics.data()->predicted_display),
 			        .stride = sizeof(decoder_metric),
 			        .multiplier = 1e3f};
 
@@ -377,8 +337,7 @@ void scenes::stream::gui_performance_metrics()
 
 			double x[] = {double(metrics_offset), double(metrics_offset)};
 			double y[] = {0, 1e9};
-			ImPlot::SetNextLineStyle(ImVec4(1, 1, 1, 1));
-			ImPlot::PlotLine("", x, y, 2);
+			ImPlot::PlotLine("", x, y, 2, {ImPlotProp_LineColor, ImVec4(1, 1, 1, 1)});
 
 			ImPlot::EndPlot();
 		}
@@ -387,15 +346,12 @@ void scenes::stream::gui_performance_metrics()
 			ImGui::SameLine();
 	}
 
-	ImPlot::PopStyleColor(5);
+	ImPlot::PopStyleColor(8);
 	{
-		ImGui::Text(
-		        "%s",
+		ImGui::TextUnformatted(
 		        fmt::format(
 		                _F("Estimated motion to photons latency: {}ms"),
-		                std::chrono::duration_cast<std::chrono::milliseconds>(
-		                        tracking_control.lock()->max_offset)
-		                        .count())
+		                tracking_control.lock()->motions_to_photons / 1'000'000)
 		                .c_str());
 
 		if (is_gui_interactable())
@@ -424,133 +380,106 @@ void scenes::stream::gui_compact_view()
 		f(_S("CPU time"), compact_cpu_time * 1000, "ms");
 		f(_S("GPU time"), compact_gpu_time * 1000, "ms");
 		f(_S("Motion to photon latency"),
-		  std::chrono::duration_cast<std::chrono::microseconds>(
-		          tracking_control.lock()->max_offset)
-		                  .count() *
-		          1e-3f,
+		  tracking_control.lock()->motions_to_photons / 1'000'000.f,
 		  "ms");
 		ImGui::EndTable();
 	}
 }
 
-std::string openxr_post_processing_flag_name(XrCompositionLayerSettingsFlagsFB flag); // TODO declaration in a .h file
-void scenes::stream::gui_settings()
+static void send_settings_changed_packet(xr::session & session, wivrn_session * network, const configuration & config)
+{
+	network->send_control(
+	        from_headset::settings_changed{
+	                .preferred_refresh_rate = config.preferred_refresh_rate,
+	                .minimum_refresh_rate = config.minimum_refresh_rate.value_or(0),
+	                .fps_divider = config.fps_divider,
+	                .bitrate_bps = config.bitrate_bps,
+	                .mirror_gamepad = config.forward_gamepad,
+	                .enabled_body_parts = config.body_part_mask,
+	        });
+}
+
+void scenes::stream::gui_settings(float)
+{
+	// same pages as the lobby, with in_game enabling the in-stream controls
+	wivrn::gui::settings_context ctx{
+	        .config = application::get_config(),
+	        .default_config = application::get_default_config(),
+	        .instance = instance,
+	        .session = session,
+	        .system = system,
+	        .imgui_ctx = *imgui_ctx,
+	        .recommended_width = width,
+	        .recommended_height = height,
+	        .in_game = true,
+	        .server_hid_forwarding = hid_forwarding_enabled(),
+	        .on_streaming_changed = [this] { send_settings_changed_packet(session, network_session.get(), application::get_config()); },
+	        .enter_foveation_adjust = [this] { next_gui_status = stream_tab::foveation_settings; },
+	        .on_foveation_override_changed = [this] {
+		        const auto & config = application::get_config();
+		        override_foveation_enable = config.override_foveation_enable;
+		        override_foveation_pitch = config.override_foveation_pitch;
+		        override_foveation_distance = config.override_foveation_distance;
+		        network_session->send_control(from_headset::override_foveation_center{
+		                .enabled = override_foveation_enable,
+		                .pitch = override_foveation_pitch,
+		                .distance = override_foveation_distance,
+		        }); },
+	};
+
+	switch (current_settings_page)
+	{
+		case settings_page::video:
+			wivrn::gui::settings_video(ctx);
+			break;
+		case settings_page::audio:
+			wivrn::gui::settings_audio(ctx);
+			break;
+		case settings_page::streaming:
+			wivrn::gui::settings_streaming(ctx);
+			break;
+		case settings_page::post_processing:
+			wivrn::gui::settings_post_processing(ctx);
+			break;
+		case settings_page::devices:
+			wivrn::gui::settings_devices(ctx);
+			break;
+		case settings_page::tracking:
+			if (wivrn::gui::settings_tracking(ctx))
+				send_settings_changed_packet(session, network_session.get(), ctx.config);
+			break;
+		case settings_page::system:
+			wivrn::gui::settings_system(ctx);
+			break;
+		case settings_page::theme:
+			wivrn::gui::settings_theme(ctx);
+			break;
+	}
+}
+
+void scenes::stream::gui_bitrate_settings(float predicted_display_period)
 {
 	auto & config = application::get_config();
+	ImGui::PushFont(nullptr, constants::gui::font_size_large);
+	ImGui::Text("%s", _S("Use the right thumbstick to adjust the bitrate"));
+	ImGui::Text("%s", _S("Press A to go back"));
+	ImGui::Text("%s", fmt::format(_F("Bitrate: {}Mbit/s"), config.bitrate_bps / 1'000'000).c_str());
+	ImGui::PopFont();
 
-	ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(20, 20));
+	// Maximum speed of 20Mbit/s
+	float delta = application::read_action_float(settings_adjust).value_or(std::pair{0, 0}).second * 20'000'000.f * predicted_display_period;
 
-	if (application::get_openxr_post_processing_supported())
+	config.bitrate_bps = std::clamp(config.bitrate_bps + static_cast<int32_t>(delta), 1'000'000u, config.max_bitrate());
+
+	bool ok = application::read_action_bool(foveation_ok).value_or(std::pair{0, false}).second;
+
+	if (ok)
 	{
-		ImGui::Text("%s", _S("OpenXR post-processing"));
-		ImGui::Indent();
-		{
-			XrCompositionLayerSettingsFlagsFB current = config.openxr_post_processing.super_sampling;
-			if (ImGui::BeginCombo(_S("Supersampling"), openxr_post_processing_flag_name(current).c_str()))
-			{
-				const XrCompositionLayerSettingsFlagsFB selectable_options[]{
-				        0,
-				        XR_COMPOSITION_LAYER_SETTINGS_NORMAL_SUPER_SAMPLING_BIT_FB,
-				        XR_COMPOSITION_LAYER_SETTINGS_QUALITY_SUPER_SAMPLING_BIT_FB};
-				for (XrCompositionLayerSettingsFlagsFB option: selectable_options)
-				{
-					if (ImGui::Selectable(openxr_post_processing_flag_name(option).c_str(), current == option, ImGuiSelectableFlags_SelectOnRelease))
-					{
-						spdlog::info("Setting OpenXR super sampling to {}", openxr_post_processing_flag_name(option));
-						config.openxr_post_processing.super_sampling = option;
-						config.save();
-					}
-					imgui_ctx->vibrate_on_hover();
-				}
-				ImGui::EndCombo();
-			}
-			imgui_ctx->vibrate_on_hover();
-			if (ImGui::IsItemHovered())
-			{
-				imgui_ctx->tooltip(_("Reduce flicker for high contrast edges.\nUseful when the input resolution is high compared to the headset display"));
-			}
-		}
-		{
-			XrCompositionLayerSettingsFlagsFB current = config.openxr_post_processing.sharpening;
-			if (ImGui::BeginCombo(_S("Sharpening"), openxr_post_processing_flag_name(current).c_str()))
-			{
-				const XrCompositionLayerSettingsFlagsFB selectable_options[]{
-				        0,
-				        XR_COMPOSITION_LAYER_SETTINGS_NORMAL_SHARPENING_BIT_FB,
-				        XR_COMPOSITION_LAYER_SETTINGS_QUALITY_SHARPENING_BIT_FB};
-				for (XrCompositionLayerSettingsFlagsFB option: selectable_options)
-				{
-					if (ImGui::Selectable(openxr_post_processing_flag_name(option).c_str(), current == option, ImGuiSelectableFlags_SelectOnRelease))
-					{
-						spdlog::info("Setting OpenXR sharpening to {}", openxr_post_processing_flag_name(option));
-						config.openxr_post_processing.sharpening = option;
-						config.save();
-					}
-					imgui_ctx->vibrate_on_hover();
-				}
-				ImGui::EndCombo();
-			}
-			imgui_ctx->vibrate_on_hover();
-			if (ImGui::IsItemHovered())
-			{
-				imgui_ctx->tooltip(_("Improve clarity of high contrast edges and counteract blur.\nUseful when the input resolution is low compared to the headset display"));
-			}
-		}
-		ImGui::Unindent();
-
-		bool send_packet = false;
-		bool save_config = false;
-		ImGui::Text("%s", _S("Foveation center override"));
-		ImGui::Indent();
-		{
-			if (ImGui::Checkbox(_S("Enable"), &override_foveation_enable))
-			{
-				send_packet = true;
-				save_config = true;
-			}
-			imgui_ctx->vibrate_on_hover();
-
-			ImGui::BeginDisabled(!override_foveation_enable);
-			ImGui::Text("%s", fmt::format(_F("Height {:.1f} deg"), -override_foveation_pitch * 180 / M_PI).c_str());
-			ImGui::Text("%s", fmt::format(_F("Distance {:.2f} m"), override_foveation_distance).c_str());
-			if (ImGui::Button(_S("Default")))
-			{
-				override_foveation_distance = configuration{}.override_foveation_distance;
-				override_foveation_pitch = configuration{}.override_foveation_pitch;
-				send_packet = true;
-				save_config = true;
-			}
-			imgui_ctx->vibrate_on_hover();
-
-			ImGui::SameLine();
-
-			if (ImGui::Button(_S("Change")))
-				gui_status = gui_status::foveation_settings;
-			imgui_ctx->vibrate_on_hover();
-
-			ImGui::EndDisabled();
-		}
-		ImGui::Unindent();
-
-		if (send_packet)
-		{
-			network_session->send_control(from_headset::override_foveation_center{
-			        .enabled = override_foveation_enable,
-			        .pitch = override_foveation_pitch,
-			        .distance = override_foveation_distance,
-			});
-		}
-
-		if (save_config)
-		{
-			auto & config = application::get_config();
-			config.override_foveation_enable = override_foveation_enable;
-			config.override_foveation_pitch = override_foveation_pitch;
-			config.override_foveation_distance = override_foveation_distance;
-			config.save();
-		}
+		config.save();
+		next_gui_status = stream_tab::settings;
 	}
-	ImGui::PopStyleVar();
+
+	send_settings_changed_packet(session, network_session.get(), application::get_config());
 }
 
 void scenes::stream::gui_foveation_settings(float predicted_display_period)
@@ -558,25 +487,25 @@ void scenes::stream::gui_foveation_settings(float predicted_display_period)
 	ImGui::PushFont(nullptr, constants::gui::font_size_large);
 	ImGui::Text("%s", _S("Use the thumbsticks to move the foveation center"));
 	ImGui::Text("%s", _S("Press A to save or B to cancel"));
-	ImGui::Text("%s", fmt::format(_F("Height {:.1f} deg"), -override_foveation_pitch * 180 / M_PI).c_str());
+	ImGui::Text("%s", fmt::format(_F("Height {:.1f} °"), -override_foveation_pitch * 180 / M_PI).c_str());
 	ImGui::Text("%s", fmt::format(_F("Distance {:.2f} m"), override_foveation_distance).c_str());
 	ImGui::PopFont();
 
 	// Maximum speed 1 rad/s
-	float delta_pitch = application::read_action_float(foveation_pitch).value_or(std::pair{0, 0}).second * predicted_display_period;
+	float delta_pitch = application::read_action_float(settings_adjust).value_or(std::pair{0, 0}).second * predicted_display_period;
 
 	// Maximum speed 2m/s @ 1m
-	float delta_distance = std::exp(std::log(2) * application::read_action_float(foveation_distance).value_or(std::pair{0, 0}).second * predicted_display_period);
+	float delta_distance = std::pow(constants::stream::gui_max_foveation_speed, application::read_action_float(foveation_distance).value_or(std::pair{0, 0}).second * predicted_display_period);
 
-	override_foveation_pitch = std::clamp<float>(override_foveation_pitch + delta_pitch, -M_PI / 3, M_PI / 3);
-	override_foveation_distance = std::clamp<float>(override_foveation_distance * delta_distance, 0.5, 100);
+	override_foveation_pitch = std::clamp<float>(override_foveation_pitch + delta_pitch, constants::stream::gui_min_foveation_pitch, constants::stream::gui_max_foveation_pitch);
+	override_foveation_distance = std::clamp<float>(override_foveation_distance * delta_distance, constants::stream::gui_min_foveation_distance, constants::stream::gui_max_foveation_distance);
 
 	bool ok = application::read_action_bool(foveation_ok).value_or(std::pair{0, false}).second;
 	bool cancel = application::read_action_bool(foveation_cancel).value_or(std::pair{0, false}).second;
 
 	if (ok)
 	{
-		gui_status = gui_status::settings;
+		next_gui_status = stream_tab::settings;
 
 		// Save settings
 		auto & config = application::get_config();
@@ -587,7 +516,7 @@ void scenes::stream::gui_foveation_settings(float predicted_display_period)
 	}
 	else if (cancel)
 	{
-		gui_status = gui_status::settings;
+		next_gui_status = stream_tab::settings;
 
 		// Restore settings
 		const auto & config = application::get_config();
@@ -603,65 +532,126 @@ void scenes::stream::gui_foveation_settings(float predicted_display_period)
 	});
 }
 
-// Return the vector v such that dot(v, x) > 0 iff x is on the side where the composition layer is visible
-static glm::vec4 compute_ray_limits(const XrPosef & pose, float margin = 0)
+void scenes::stream::gui_applications()
 {
-	glm::quat q{
-	        pose.orientation.w,
-	        pose.orientation.x,
-	        pose.orientation.y,
-	        pose.orientation.z,
-	};
+	auto now = instance.now();
+	if (now - running_application_req > 1'000'000'000)
+	{
+		running_application_req = now;
+		network_session->send_control(from_headset::get_running_applications{});
+	}
 
-	glm::vec3 p{
-	        pose.position.x,
-	        pose.position.y,
-	        pose.position.z,
-	};
+	wivrn::ui::page_header(_cS("page header title", "Applications"), _cS("page header subtitle", "Running XR applications on the server."));
 
-	glm::vec3 normal = glm::column(glm::mat3_cast(q), 2);
+	auto apps = running_applications.lock();
+	std::ranges::sort(apps->applications, [](auto & l, auto & r) {
+		if (l.overlay == r.overlay)
+			return false;
+		return r.overlay;
+	});
 
-	return glm::vec4(normal, -glm::dot(p, normal) - margin);
+	const float gap = ImGui::GetStyle().ItemSpacing.x;
+	const float ctrl_h = ImGui::GetFrameHeight() * wivrn::ui::metrics::control_height;
+	const std::string stop_label = wivrn::ui::icon_label(ICON_FA_XMARK, _C("button label to ask an application to quit", "Stop"));
+	const float stop_w = wivrn::ui::button_width(stop_label);
+	const std::string active_label = wivrn::ui::icon_label(ICON_FA_CIRCLE_CHECK, _C("chip displayed next to a running application while streaming", "Active"));
+	const float active_w = wivrn::ui::chip_width(active_label, false, stop_w);
+
+	ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, wivrn::ui::metrics::card_item_spacing);
+	wivrn::ui::begin_list_card("##running");
+	{
+		if (apps->applications.empty())
+		{
+			ImGui::PushStyleColor(ImGuiCol_Text, wivrn::ui::current().text_muted);
+			ImGui::TextUnformatted(_S("No XR application is currently running."));
+			ImGui::PopStyleColor();
+		}
+
+		bool overlay = false;
+		bool first = true;
+		for (const auto & app: apps->applications)
+		{
+			if (app.overlay and not overlay)
+			{
+				overlay = true;
+				ImGui::PushStyleColor(ImGuiCol_Text, wivrn::ui::current().text_muted);
+				ImGui::TextUnformatted(_S("Overlays"));
+				ImGui::PopStyleColor();
+				first = true;
+			}
+			ImGui::PushID(static_cast<int>(app.id));
+			if (not first)
+				wivrn::ui::row_separator();
+			first = false;
+
+			// overlays and the active app aren't selectable, only their stop button acts
+			const bool interactive = not(app.active or app.overlay);
+			const float trailing = stop_w + (app.active ? gap + active_w : 0) + wivrn::ui::metrics::list_row_pad;
+			const auto row = wivrn::ui::begin_list_row("##row", ICON_FA_CUBE, 0, app.name, {}, app.active, trailing, 0, false, interactive);
+			float x = row.max.x;
+
+			ImGui::SetCursorScreenPos(row.trailing(x, {stop_w, ctrl_h}));
+			if (wivrn::ui::button(stop_label, wivrn::ui::button_style::danger, {stop_w, 0}))
+				network_session->send_control(from_headset::stop_application{.id = app.id});
+			if (ImGui::IsItemHovered())
+				imgui_ctx->tooltip(_S("Request to quit, may be ignored by the application"));
+			x -= stop_w + gap;
+
+			if (app.active)
+			{
+				ImGui::SetCursorScreenPos(row.trailing(x, {active_w, ctrl_h}));
+				wivrn::ui::chip(active_label, wivrn::ui::chip_style::success, false, ctrl_h);
+			}
+
+			if (row.clicked and interactive)
+				network_session->send_control(from_headset::set_active_application{.id = app.id});
+
+			wivrn::ui::end_list_row();
+			ImGui::PopID();
+		}
+	}
+	wivrn::ui::end_card();
+	ImGui::PopStyleVar();
+}
+
+void scenes::stream::gui_toasts()
+{
+	auto toast = gui_toast.lock();
+
+	if (!toast->has_value())
+	{
+		ImGui::Text("%s", _S("Press both thumbsticks to display the WiVRn window"));
+		return;
+	}
+
+	ImGui::Text("%s", (*toast)->content.c_str());
 }
 
 void scenes::stream::draw_gui(XrTime predicted_display_time, XrDuration predicted_display_period)
 {
-	if (not(plots_toggle_1 and plots_toggle_2))
-		return;
-	bool interactable = true;
-	XrSpace world_space = application::space(xr::spaces::world);
-	auto views = session.locate_views(viewconfig, predicted_display_time, world_space).second;
+	if (auto new_status = next_gui_status.load(); new_status != gui_status)
+	{
+		spdlog::info("Switch tab from {} to {}", magic_enum::enum_name(gui_status), magic_enum::enum_name(new_status));
 
-	switch (gui_status)
-	{
-		case gui_status::hidden:
-		case gui_status::foveation_settings:
-		case gui_status::overlay_only:
-		case gui_status::compact:
-			interactable = false;
-			break;
-		case gui_status::stats:
-		case gui_status::settings:
-			break;
-	}
-	imgui_ctx->set_controllers_enabled(interactable);
-	if (interactable)
-	{
-		if (system.hand_tracking_supported())
+		if (not is_gui_interactable() and is_interactable(new_status))
 		{
-			left_hand = session.create_hand_tracker(XR_HAND_LEFT_EXT);
-			right_hand = session.create_hand_tracker(XR_HAND_RIGHT_EXT);
+			if (auto head_position = application::locate_controller(application::space(xr::spaces::view), application::space(xr::spaces::world), predicted_display_time))
+			{
+				world_gui_orientation = head_position->second * head_gui_orientation;
+				world_gui_position = head_position->first + glm::mat3_cast(head_position->second) * head_gui_position;
+			}
 		}
-	}
-	else
-	{
-		left_hand.reset();
-		right_hand.reset();
-	}
+		else if (is_gui_interactable() and not is_interactable(new_status))
+		{
+			if (auto head_position = application::locate_controller(application::space(xr::spaces::view), application::space(xr::spaces::world), predicted_display_time))
+			{
+				head_gui_orientation = glm::conjugate(head_position->second) * world_gui_orientation;
+				head_gui_position = glm::mat3_cast(glm::conjugate(head_position->second)) * (world_gui_position - head_position->first);
+			}
+		}
 
-	if (gui_status != last_gui_status)
-	{
-		last_gui_status = gui_status;
+		stored_gui_status = gui_status;
+		gui_status = new_status;
 		gui_status_last_change = predicted_display_time;
 
 		// Override session state if the GUI is interactable
@@ -673,17 +663,63 @@ void scenes::stream::draw_gui(XrTime predicted_display_time, XrDuration predicte
 			network_session->send_control(from_headset::session_state_changed{
 			        .state = XR_SESSION_STATE_VISIBLE,
 			});
+
+		network_session->send_control(from_headset::stream_tab_changed{.tab = new_status});
+	}
+
+	bool interactable = true;
+	XrSpace world_space = application::space(xr::spaces::world);
+	auto views = session.locate_views(viewconfig, predicted_display_time, world_space).second;
+
+	switch (gui_status)
+	{
+		case stream_tab::hidden:
+		case stream_tab::foveation_settings:
+		case stream_tab::overlay_only:
+		case stream_tab::compact:
+			interactable = false;
+			break;
+		case stream_tab::stats:
+		case stream_tab::settings:
+		case stream_tab::applications:
+		case stream_tab::application_launcher:
+			break;
+	}
+	imgui_ctx->set_controllers_enabled(interactable and not recentering_context);
+	if (interactable)
+	{
+		if (system.hand_tracking_supported())
+		{
+			if (not left_hand)
+				left_hand = session.create_hand_tracker(XR_HAND_LEFT_EXT);
+			if (not right_hand)
+				right_hand = session.create_hand_tracker(XR_HAND_RIGHT_EXT);
+		}
+	}
+	else
+	{
+		left_hand.reset();
+		right_hand.reset();
 	}
 
 	float alpha = 1;
-	if (gui_status == gui_status::hidden)
+	bool is_urgent = false;
+	if (gui_status == stream_tab::hidden)
 	{
-		float t = (predicted_display_time - gui_status_last_change) * 1.e-9f;
+		auto toast = gui_toast.lock();
+		if (toast->has_value())
+			is_urgent = (*toast)->is_urgent;
 
-		alpha = std::clamp<float>(1 - (t - constants::stream::fade_delay) / constants::stream::fade_duration, 0, 1);
+		float t = (predicted_display_time - gui_status_last_change) * 1.e-9f;
+		float delay = is_urgent ? constants::stream::urgent_fade_delay : constants::stream::fade_delay;
+
+		alpha = std::clamp<float>(1 - (t - delay) / constants::stream::fade_duration, 0, 1);
 
 		if (alpha == 0)
+		{
+			toast->reset();
 			return;
+		}
 	}
 
 	// Lock the GUI position to the head, do it before displaying the GUI to avoid being off by one frame when gui_status changes
@@ -693,67 +729,104 @@ void scenes::stream::draw_gui(XrTime predicted_display_time, XrDuration predicte
 		glm::mat3 M = glm::mat3_cast(head_position->second);
 		switch (gui_status)
 		{
-			case gui_status::foveation_settings:
+			case stream_tab::foveation_settings:
 				imgui_ctx->layers()[0].orientation = head_position->second;
-				imgui_ctx->layers()[0].position = head_position->first + M * glm::vec3{0, -override_foveation_distance * sin(override_foveation_pitch), -override_foveation_distance};
+				imgui_ctx->layers()[0].position = head_position->first + M * glm::vec3{0, override_foveation_distance * sin(override_foveation_pitch), -override_foveation_distance};
 				break;
 
-			case gui_status::hidden:
+			case stream_tab::hidden:
 				// Always use the same position for the GUI shortcut tip
 				imgui_ctx->layers()[0].orientation = head_position->second;
 				imgui_ctx->layers()[0].position = head_position->first + M * glm::vec3{0.0, -0.4, -1.0};
 				break;
 
-			case gui_status::overlay_only:
-			case gui_status::compact:
-			case gui_status::stats:
-			case gui_status::settings:
+			case stream_tab::overlay_only:
+			case stream_tab::compact:
 				imgui_ctx->layers()[0].orientation = head_position->second * head_gui_orientation;
 				imgui_ctx->layers()[0].position = head_position->first + M * head_gui_position;
+				break;
+
+			case stream_tab::stats:
+			case stream_tab::settings:
+			case stream_tab::applications:
+			case stream_tab::application_launcher:
+				imgui_ctx->layers()[0].orientation = world_gui_orientation;
+				imgui_ctx->layers()[0].position = world_gui_position;
 				break;
 		}
 	}
 
-	const float tab_width = 300;
+	// popup layer floats in front of the main panel so combos and modals pop as their own quad
+	imgui_ctx->place_layer_relative(2, 0, constants::gui::popup_position);
+
+	const float tab_width = wivrn::ui::metrics::sidebar_width;
+	const float top_bar_h = wivrn::ui::metrics::top_bar_height;
+	const float content_margin = wivrn::ui::metrics::content_margin;
 	const ImVec2 margin_around_window{50, 50};
 
-	const ImGuiStyle & style = ImGui::GetStyle();
+	ImGuiStyle & style = ImGui::GetStyle();
 	imgui_ctx->new_frame(predicted_display_time);
 
-	ImVec2 content_size{ImGui::GetMainViewport()->Size - ImVec2{tab_width, 0} - margin_around_window * 2};
+	// theme the shared cards like the lobby, widget hooks are global so re-point at this scene
+	style.FontScaleMain = wivrn::ui::current().font_scale * wivrn::ui::metrics::font_base;
+	style.WindowRounding = wivrn::ui::current().card_rounding;
+	style.ChildRounding = wivrn::ui::current().card_rounding;
+	style.PopupRounding = wivrn::ui::current().card_rounding;
+	style.FrameRounding = wivrn::ui::current().rounding;
+	style.GrabRounding = wivrn::ui::current().rounding;
+	style.TabRounding = wivrn::ui::current().rounding;
+	style.Colors[ImGuiCol_Text] = wivrn::ui::current().text;
+	style.Colors[ImGuiCol_TextDisabled] = wivrn::ui::current().text_muted;
+	wivrn::ui::set_popup_center(imgui_ctx->layers()[2].vp_center(), float(imgui_ctx->layers()[2].vp_size.y));
+	wivrn::ui::set_hover_haptic([this] { imgui_ctx->vibrate_on_hover(); });
+	wivrn::ui::set_tooltip_hook([this](const char * text) { imgui_ctx->tooltip(text); });
+
+	ImVec2 viewport_size(imgui_ctx->layers()[0].vp_size.x, imgui_ctx->layers()[0].vp_size.y);
+	ImVec2 content_size{viewport_size - ImVec2{tab_width, 0} - margin_around_window * 2};
 	ImVec2 content_center = margin_around_window + content_size / 2 + ImVec2{tab_width, 0};
 
-	bool display_tabs, always_auto_resize;
+	bool display_tabs = false;
+	bool always_auto_resize = false;
 	switch (gui_status)
 	{
-		case gui_status::overlay_only:
+		case stream_tab::overlay_only:
 			ImGui::SetNextWindowPos(content_center, ImGuiCond_Always, ImVec2(0.5f, 0.5f));
 			ImGui::SetNextWindowSize(content_size);
-			always_auto_resize = false;
-			display_tabs = false;
 			break;
 
-		case gui_status::hidden:
-		case gui_status::foveation_settings:
-			ImGui::SetNextWindowPos(ImGui::GetMainViewport()->Size / 2, ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+		case stream_tab::hidden:
+		case stream_tab::foveation_settings:
+			ImGui::SetNextWindowPos(viewport_size / 2, ImGuiCond_Always, ImVec2(0.5f, 0.5f));
 			always_auto_resize = true;
-			display_tabs = false;
 			break;
 
-		case gui_status::compact:
+		case stream_tab::compact:
 			ImGui::SetNextWindowPos(content_center, ImGuiCond_Always, ImVec2(0.5f, 0.5f));
 			always_auto_resize = true;
-			display_tabs = false;
 			break;
 
-		case gui_status::stats:
-		case gui_status::settings:
+		case stream_tab::stats:
+		case stream_tab::settings:
+		case stream_tab::applications:
 			ImGui::SetNextWindowPos(margin_around_window);
-			ImGui::SetNextWindowSize(ImGui::GetMainViewport()->Size - margin_around_window * 2);
-			always_auto_resize = false;
+			ImGui::SetNextWindowSize(viewport_size - margin_around_window * 2);
 			display_tabs = true;
 			break;
+		case stream_tab::application_launcher:
+			ImGui::SetNextWindowPos(margin_around_window);
+			ImGui::SetNextWindowSize(viewport_size - margin_around_window * 2);
+			break;
 	}
+
+	if (is_urgent)
+	{
+		ImGui::PushStyleColor(ImGuiCol_Border, constants::stream::urgent_border_color);
+		ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 4);
+	}
+
+	// themed translucent background, matching the lobby
+	const wivrn::ui::theme & th = wivrn::ui::current();
+	ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4{th.background.x, th.background.y, th.background.z, wivrn::ui::background_alpha()});
 
 	ImGui::PushStyleVar(ImGuiStyleVar_ChildBorderSize, 0);
 	if (always_auto_resize)
@@ -767,85 +840,215 @@ void scenes::stream::draw_gui(XrTime predicted_display_time, XrDuration predicte
 		ImGui::Begin("Stream settings", nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove);
 	}
 
+	if (is_urgent)
+	{
+		ImGui::PopStyleColor(1);
+		ImGui::PopStyleVar(1);
+	}
+
 	ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {8, 8});
 	ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 10);
 
 	switch (gui_status)
 	{
-		case gui_status::hidden:
-			ImGui::Text("%s", _S("Press both thumbsticks to display the WiVRn window"));
+		case stream_tab::hidden:
+			gui_toasts();
 			break;
 
-		case gui_status::overlay_only:
+		case stream_tab::overlay_only:
 			ImGui::SetCursorPos({20, 20});
 			ImGui::BeginChild("Main", ImVec2(ImGui::GetWindowSize().x - ImGui::GetCursorPosX(), 0));
 			gui_performance_metrics();
 			ImGui::EndChild();
 			break;
 
-		case gui_status::compact:
+		case stream_tab::compact:
 			gui_compact_view();
 			break;
 
-		case gui_status::stats:
-			ImGui::SetCursorPos({tab_width + 20, 20});
-			ImGui::BeginChild("Main", ImVec2(ImGui::GetWindowSize().x - ImGui::GetCursorPosX(), 0));
+		case stream_tab::stats:
+			ImGui::SetCursorPos({tab_width + content_margin, top_bar_h});
+			ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {20, 20});
+			ImGui::BeginChild("Main", ImVec2(ImGui::GetWindowSize().x - ImGui::GetCursorPosX() - content_margin, 0));
+			ImGui::SetCursorPosY(20);
+			wivrn::ui::page_header(_S("Statistics"), _S("Live streaming performance."));
+			ImGui::BeginChild("plots", {0, 0});
 			gui_performance_metrics();
 			ImGui::EndChild();
-			break;
-
-		case gui_status::settings:
-			ImGui::SetCursorPos({tab_width + 20, 20});
-			ImGui::BeginChild("Main", ImVec2(ImGui::GetWindowSize().x - ImGui::GetCursorPosX(), 0));
-			gui_settings();
 			ImGui::EndChild();
+			ImGui::PopStyleVar();
 			break;
 
-		case gui_status::foveation_settings:
+		case stream_tab::settings:
+			ImGui::SetCursorPos({tab_width + content_margin, top_bar_h});
+			ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {20, 20});
+			ImGui::BeginChild("Main", ImVec2(ImGui::GetWindowSize().x - ImGui::GetCursorPosX() - content_margin, 0));
+			ImGui::SetCursorPosY(20);
+			gui_settings(predicted_display_period * 1.e-9f);
+			ImGui::Dummy(ImVec2(0, 20));
+			ScrollWhenDragging();
+			ImGui::EndChild();
+			ImGui::PopStyleVar();
+			break;
+
+		case stream_tab::foveation_settings:
 			gui_foveation_settings(predicted_display_period * 1.e-9f);
 			break;
+
+		case stream_tab::applications:
+			ImGui::SetCursorPos({tab_width + content_margin, top_bar_h});
+			ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {20, 20});
+			ImGui::BeginChild("Main", ImVec2(ImGui::GetWindowSize().x - ImGui::GetCursorPosX() - content_margin, 0));
+			ImGui::SetCursorPosY(20);
+			gui_applications();
+			ImGui::Dummy(ImVec2(0, 20));
+			ScrollWhenDragging();
+			ImGui::EndChild();
+			ImGui::PopStyleVar();
+			break;
+
+		case stream_tab::application_launcher:
+			if (apps.draw_gui(*imgui_ctx, _("Cancel")) != app_launcher::None)
+				next_gui_status = stream_tab::applications;
 	}
 
 	ImGui::PopStyleVar(2); // ImGuiStyleVar_WindowPadding, ImGuiStyleVar_FrameRounding
 
 	if (display_tabs)
 	{
-		ImGui::PushStyleColor(ImGuiCol_ChildBg, IM_COL32(0, 0, 0, 255));
-		ImGui::SetCursorPos(style.WindowPadding);
+		// top bar: logo left, battery/connection status/window controls right
+		const float side = ImGui::GetFrameHeight() * wivrn::ui::metrics::control_height;
+		std::vector<wivrn::ui::top_bar_item> top_items;
+		if (auto bat = wivrn::gui::battery_status_indicator(instance.now()))
+			top_items.push_back({wivrn::ui::chip_width(bat->label, false, side),
+			                     [bat = *bat, side] { wivrn::ui::chip(bat.label, bat.style, false, side); }});
+		const std::string conn = _C("status in the title bar", "Connected");
+		top_items.push_back({wivrn::ui::chip_width(conn, true, side),
+		                     [conn, side] { wivrn::ui::chip(conn, wivrn::ui::chip_style::success, true, side); }});
+		const std::string close_label = _S("Close");
+		top_items.push_back({wivrn::ui::button_width(ICON_FA_XMARK, close_label),
+		                     [this, close_label, side] {
+			                     if (wivrn::ui::button(ICON_FA_XMARK, close_label, wivrn::ui::button_style::secondary, {0, side}))
+				                     next_gui_status = stream_tab::hidden;
+		                     }});
+		// disconnect asks for confirmation, OpenPopup/confirm_modal share the window id stack
+		bool request_disconnect = false;
+		const std::string disconnect_label = _S("Disconnect");
+		top_items.push_back({wivrn::ui::button_width(ICON_FA_DOOR_OPEN, disconnect_label),
+		                     [&request_disconnect, disconnect_label, side] {
+			                     if (wivrn::ui::button(ICON_FA_DOOR_OPEN, disconnect_label, wivrn::ui::button_style::danger, {0, side}))
+				                     request_disconnect = true;
+		                     }});
+		wivrn::ui::top_bar(top_bar_h, wivrn_logo, top_items);
+
+		if (request_disconnect)
 		{
-			ImGui::BeginChild("Tabs", {tab_width, ImGui::GetContentRegionMax().y - ImGui::GetWindowContentRegionMin().y});
-
-			ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(10, 10));
-			RadioButtonWithoutCheckBox(ICON_FA_COMPUTER "  " + _("Stats"), gui_status, gui_status::stats, {tab_width, 0});
-			imgui_ctx->vibrate_on_hover();
-
-			RadioButtonWithoutCheckBox(ICON_FA_GEARS "  " + _("Settings"), gui_status, gui_status::settings, {tab_width, 0});
-			imgui_ctx->vibrate_on_hover();
-
-			int n_items_at_end = 4;
-			ImGui::SetCursorPosY(ImGui::GetContentRegionMax().y - n_items_at_end * ImGui::GetCurrentContext()->FontSize - (n_items_at_end * 2) * style.FramePadding.y - (n_items_at_end - 1) * style.ItemSpacing.y - style.WindowPadding.y);
-
-			RadioButtonWithoutCheckBox(ICON_FA_CHART_LINE "  " + _("Statistics overlay"), gui_status, gui_status::overlay_only, {tab_width, 0});
-			imgui_ctx->vibrate_on_hover();
-
-			RadioButtonWithoutCheckBox(ICON_FA_MINIMIZE "  " + _("Compact view"), gui_status, gui_status::compact, {tab_width, 0});
-			imgui_ctx->vibrate_on_hover();
-
-			RadioButtonWithoutCheckBox(ICON_FA_XMARK "  " + _("Close"), gui_status, gui_status::hidden, {tab_width, 0});
-			imgui_ctx->vibrate_on_hover();
-
-			bool dummy = false;
-			if (RadioButtonWithoutCheckBox(ICON_FA_DOOR_OPEN "  " + _("Disconnect"), dummy, true, {tab_width, 0}))
-				exit();
-			imgui_ctx->vibrate_on_hover();
-
-			ImGui::PopStyleVar(); // ImGuiStyleVar_FramePadding
-			ImGui::EndChild();
+			network_session->send_control(from_headset::get_running_applications{});
+			ImGui::OpenPopup("confirm disconnect");
 		}
-		ImGui::PopStyleColor(); // ImGuiCol_ChildBg
+
+		if (wivrn::ui::begin_modal("confirm disconnect", _("Disconnect")))
+		{
+			const std::string kill_apps = ICON_FA_XMARK " " + _("Stop all applications");
+			const std::string disconnect_only = ICON_FA_DOOR_OPEN " " + _("Disconnect");
+			const std::string cancel = _("Cancel");
+
+			const float gap = ImGui::GetStyle().ItemSpacing.x;
+
+			const float kill_apps_w = ImGui::CalcTextSize(kill_apps.c_str()).x + wivrn::ui::metrics::button_padding.x * 2;
+			const float disconnect_only_w = ImGui::CalcTextSize(disconnect_only.c_str()).x + wivrn::ui::metrics::button_padding.x * 2;
+			const float cancel_w = ImGui::CalcTextSize(cancel.c_str()).x + wivrn::ui::metrics::button_padding.x * 2;
+			const float buttons_width = disconnect_only_w + cancel_w + kill_apps_w + 2 * gap;
+
+			ImGui::Dummy({std::max<float>(500, buttons_width), 0});
+
+			const auto & t = wivrn::ui::current();
+			ImGui::PushStyleColor(ImGuiCol_Text, t.text_muted);
+			ImGui::TextWrapped("%s", _S("Disconnect from the server and return to the lobby?"));
+			ImGui::TextWrapped("%s", _S("The following applications/overlays are open:"));
+
+			for (const auto & app: running_applications.lock()->applications)
+				ImGui::TextWrapped("• %s", app.name.c_str());
+
+			ImGui::PopStyleColor();
+			ImGui::Dummy({0, 12});
+
+			ImGui::SetCursorPosX(ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x - buttons_width);
+
+			if (button(kill_apps, wivrn::ui::button_style::danger, {kill_apps_w, 0}))
+			{
+				for (const auto & app: running_applications.lock()->applications)
+					network_session->send_control(from_headset::stop_application{.id = app.id});
+				exit();
+				ImGui::CloseCurrentPopup();
+			}
+			ImGui::SameLine();
+
+			if (button(disconnect_only, wivrn::ui::button_style::primary, {disconnect_only_w, 0}))
+			{
+				exit();
+				ImGui::CloseCurrentPopup();
+			}
+			ImGui::SameLine();
+
+			if (button(cancel, wivrn::ui::button_style::secondary, {cancel_w, 0}))
+			{
+				ImGui::CloseCurrentPopup();
+			}
+
+			wivrn::ui::end_modal();
+		}
+
+		// navigation sidebar, the settings items swap the page but keep the coarse settings tab
+		wivrn::ui::begin_sidebar(top_bar_h, tab_width, 2);
+		{
+			wivrn::ui::nav_section(_cS("tab group", "STREAM"));
+			if (wivrn::ui::nav_item(ICON_FA_LIST, _cS("tab label", "Applications"), gui_status == stream_tab::applications))
+				next_gui_status = stream_tab::applications;
+			if (wivrn::ui::nav_item(ICON_FA_ROCKET, _cS("tab label", "Start"), false))
+			{
+				apps.reset();
+				network_session->send_control(from_headset::get_application_list{
+				        .language = application::get_messages_info().language,
+				        .country = application::get_messages_info().country,
+				        .variant = application::get_messages_info().variant,
+				});
+				next_gui_status = stream_tab::application_launcher;
+			}
+			if (wivrn::ui::nav_item(ICON_FA_COMPUTER, _S("Statistics"), gui_status == stream_tab::stats))
+				next_gui_status = stream_tab::stats;
+
+			wivrn::ui::nav_section(_cS("tab group", "SETTINGS"));
+			auto settings_item = [&](const char * icon, const std::string & label, settings_page page) {
+				if (wivrn::ui::nav_item(icon, label, gui_status == stream_tab::settings and current_settings_page == page))
+				{
+					current_settings_page = page;
+					next_gui_status = stream_tab::settings;
+				}
+			};
+			settings_item(ICON_FA_IMAGE, _cS("tab label", "Video"), settings_page::video);
+			settings_item(ICON_FA_VOLUME_HIGH, _cS("tab label", "Audio"), settings_page::audio);
+			settings_item(ICON_FA_TOWER_BROADCAST, _cS("tab label", "Streaming"), settings_page::streaming);
+			settings_item(ICON_FA_WAND_MAGIC_SPARKLES, _cS("tab label", "Post-processing"), settings_page::post_processing);
+			settings_item(ICON_FA_KEYBOARD, _cS("tab label", "Devices"), settings_page::devices);
+			settings_item(ICON_FA_LOCATION_CROSSHAIRS, _cS("tab label", "Tracking"), settings_page::tracking);
+			settings_item(ICON_FA_GEARS, _cS("tab label", "System"), settings_page::system);
+			settings_item(ICON_FA_PALETTE, _cS("tab label", "Theme"), settings_page::theme);
+
+			// pinned to the bottom
+			wivrn::ui::sidebar_footer();
+			if (wivrn::ui::nav_item(ICON_FA_CHART_LINE, _cS("tab label", "Statistics overlay"), false))
+				next_gui_status = stream_tab::overlay_only;
+			if (wivrn::ui::nav_item(ICON_FA_MINIMIZE, _cS("tab label", "Compact view"), false))
+				next_gui_status = stream_tab::compact;
+		}
+		wivrn::ui::end_sidebar();
+
+		wivrn::ui::shell_dividers(top_bar_h, tab_width);
 	}
 	ImGui::End();
-	ImGui::PopStyleVar(2); // ImGuiStyleVar_ChildBorderSize, ImGuiStyleVar_WindowPadding
+	ImGui::PopStyleVar(2);  // ImGuiStyleVar_ChildBorderSize, ImGuiStyleVar_WindowPadding
+	ImGui::PopStyleColor(); // ImGuiCol_WindowBg
 
 	auto layers = imgui_ctx->end_frame();
 
@@ -870,21 +1073,23 @@ void scenes::stream::draw_gui(XrTime predicted_display_time, XrDuration predicte
 			}
 
 			if (state)
-				update_gui_position(controller);
+				update_gui_position(controller, predicted_display_period * 1e-9f);
 			else
 				recentering_context.reset();
 		}
 		else if (auto state = application::read_action_bool(recenter_left); state and state->second)
-			update_gui_position(xr::spaces::aim_left);
+			update_gui_position(xr::spaces::aim_left, predicted_display_period * 1e-9f);
 		else if (auto state = application::read_action_bool(recenter_right); state and state->second)
-			update_gui_position(xr::spaces::aim_right);
+			update_gui_position(xr::spaces::aim_right, predicted_display_period * 1e-9f);
 		else
 			recentering_context.reset();
 
-		std::vector<glm::vec4> ray_limits;
-
-		for (auto [_, layer]: layers)
-			ray_limits.push_back(compute_ray_limits(layer.pose));
+		std::vector<glm::mat4> world_to_window;
+		for (auto & window: imgui_ctx->windows())
+		{
+			if (window.space == xr::spaces::world)
+				world_to_window.push_back(glm::inverse(glm::translate(window.position) * glm::mat4(glm::mat3_cast(window.orientation)) * glm::scale(glm::vec3(window.size, 1))));
+		}
 
 		bool hide_left_controller = false;
 		bool hide_right_controller = false;
@@ -901,7 +1106,14 @@ void scenes::stream::draw_gui(XrTime predicted_display_time, XrDuration predicte
 				hide_right_controller = true;
 		}
 
-		input->apply(world, world_space, predicted_display_time, hide_left_controller, hide_right_controller, ray_limits);
+		input->apply(world,
+		             world_space,
+		             predicted_display_time,
+		             hide_left_controller,
+		             hide_left_controller,
+		             hide_right_controller,
+		             hide_right_controller,
+		             world_to_window);
 
 		// Add the layer with the controllers
 		if (composition_layer_depth_test_supported)
@@ -918,13 +1130,13 @@ void scenes::stream::draw_gui(XrTime predicted_display_time, XrDuration predicte
 		}
 	}
 
-	// Add the layer with the GUI
 	for (auto [_, layer]: layers)
 	{
 		add_quad_layer(layer.layerFlags, layer.space, layer.eyeVisibility, layer.subImage, layer.pose, layer.size);
 		if (composition_layer_depth_test_supported)
 			set_depth_test(true, XR_COMPARE_OP_LESS_FB);
-		if (alpha < 1 and composition_layer_color_scale_bias_supported)
+
+		else if (alpha < 1 and composition_layer_color_scale_bias_supported)
 			set_color_scale_bias({alpha, alpha, alpha, alpha}, {});
 	}
 

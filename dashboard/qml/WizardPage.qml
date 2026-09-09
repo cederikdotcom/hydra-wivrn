@@ -195,7 +195,7 @@ Kirigami.ScrollablePage {
 
             BetterLabel {
                 Layout.fillWidth: true
-                text: i18n("No precompiled APK is available for this version.")
+                text: i18n("No APK is available for this version")
                 visible: !ApkInstaller.busy && !ApkInstaller.apkAvailable
             }
 
@@ -257,70 +257,6 @@ Kirigami.ScrollablePage {
                 Kirigami.Action {
                     text: i18n("Next")
                     icon.name: "go-next"
-                    onTriggered: pageStack.push(page_selectgame_component.createObject(pageStack))
-                },
-                Kirigami.Action {
-                    text: i18n("Cancel")
-                    onTriggered: wizard.cancel()
-                }
-            ]
-        }
-    }
-
-    Component {
-        id: page_selectgame_component
-
-        WizardStep {
-            id: page_selectgame
-
-            Controls.Label {
-                Layout.fillWidth: true
-                wrapMode: Text.WordWrap
-                font.pointSize: Kirigami.Theme.defaultFont.pointSize * 1.35
-                text: i18n("Select the application you want to start")
-            }
-
-            Controls.Label {
-                Layout.fillWidth: true
-                wrapMode: Text.WordWrap
-                text: i18n("The application you choose will be started automatically when you connect your headset.")
-                Layout.topMargin: 2 * Kirigami.Units.largeSpacing
-            }
-
-            SelectGame {}
-
-            SteamLaunchOptions {
-                visible: WivrnServer.steamCommand != ""
-                Layout.topMargin: 2 * Kirigami.Units.largeSpacing
-            }
-
-            Controls.Label {
-                Layout.fillWidth: true
-                wrapMode: Text.WordWrap
-                font.pointSize: Kirigami.Theme.defaultFont.pointSize * 1.35
-                text: i18n("Important information")
-                Layout.topMargin: 2 * Kirigami.Units.largeSpacing
-            }
-
-            Controls.Label {
-                Layout.fillWidth: true
-                wrapMode: Text.WordWrap
-                text: i18n("WiVRn entirely replaces SteamVR, you should not start SteamVR while WiVRn is running.")
-            }
-
-            Item {
-                Layout.fillHeight: true
-            }
-
-            actions: [
-                Kirigami.Action {
-                    text: i18n("Back")
-                    icon.name: "go-previous"
-                    onTriggered: pageStack.goBack()
-                },
-                Kirigami.Action {
-                    text: i18n("Next")
-                    icon.name: "go-next"
                     onTriggered: pageStack.push(page_startwivrn_component.createObject(pageStack))
                 },
                 Kirigami.Action {
@@ -356,7 +292,26 @@ Kirigami.ScrollablePage {
                 Layout.fillWidth: true
                 wrapMode: Text.WordWrap
                 font.pointSize: Kirigami.Theme.defaultFont.pointSize * 1.35
+                text: i18n("Important information")
+            }
+
+            Controls.Label {
+                Layout.fillWidth: true
+                wrapMode: Text.WordWrap
+                text: i18n("WiVRn entirely replaces SteamVR, you should not start SteamVR while WiVRn is running.")
+            }
+
+            SteamLaunchOptions {
+                visible: WivrnServer.steamCommand != ""
+                Layout.topMargin: 2 * Kirigami.Units.largeSpacing
+            }
+
+            Controls.Label {
+                Layout.fillWidth: true
+                wrapMode: Text.WordWrap
+                font.pointSize: Kirigami.Theme.defaultFont.pointSize * 1.35
                 text: i18n("Start the WiVRn app on your headset")
+                Layout.topMargin: 2 * Kirigami.Units.largeSpacing
             }
             Controls.Label {
                 Layout.fillWidth: true
@@ -374,6 +329,16 @@ Kirigami.ScrollablePage {
                     text: i18n("Connect by USB")
                     onClicked: select_usb_device.connect()
                     enabled: select_usb_device.connected_headset_count > 0
+
+                    Controls.ToolTip.visible: WivrnServer.serverStatus == WivrnServer.Started&& hovered
+                    Controls.ToolTip.delay: Kirigami.Units.toolTipDelay
+                    Controls.ToolTip.text: {
+                        if (!Adb.adbInstalled)
+                            return i18n("ADB is not installed");
+                        if (select_usb_device.connected_headset_count == 0)
+                            return i18n("No headset is connected or your headset is not in developer mode");
+                        return "";
+                    }
                 }
             }
             Controls.Label {
@@ -385,12 +350,12 @@ Kirigami.ScrollablePage {
             }
             BetterLabel {
                 Layout.fillWidth: true
-                text: i18n("If you installed WiVRn over USB on a Meta headset, the app is in the \"unknown sources\" section.")
+                text: i18n("If you installed WiVRn over USB on a Meta or Pico headset, the app is in the \"unknown sources\" section.")
                 Layout.topMargin: Kirigami.Units.largeSpacing
             }
             BetterLabel {
                 Layout.fillWidth: true
-                text: i18n("If the server is not visible or the connection fails, check that port 5353 (UDP) and 9757 (TCP and UDP) are open in your firewall.")
+                text: i18n("If the server is not visible or the connection fails, check that ports 5353 (UDP) and 9757 (TCP and UDP) are open in your firewall.")
                 Layout.topMargin: Kirigami.Units.largeSpacing
             }
             Item {

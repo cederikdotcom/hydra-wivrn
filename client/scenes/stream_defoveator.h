@@ -19,7 +19,6 @@
 
 #pragma once
 
-#include "blitter.h"
 #include "vk/allocation.h"
 #include "wivrn_packets.h"
 #include <vulkan/vulkan_raii.hpp>
@@ -49,13 +48,6 @@ class stream_defoveator
 	pipeline_t pipeline_rgb[view_count];
 	pipeline_t pipeline_a[view_count];
 
-	// Allowed sizes for variable shading rate
-	// indices are for x, y
-	// 0 is 1 pixel
-	// 1 is 2 or 3 pixels
-	// 2 is 4 pixels or more
-	uint32_t fragment_sizes[3][3] = {};
-
 	// Destination images
 	std::vector<vk::Image> output_images;
 	std::vector<vk::raii::ImageView> output_image_views;
@@ -65,10 +57,21 @@ class stream_defoveator
 	void ensure_vertices(size_t num_vertices);
 	vertex * get_vertices(size_t view);
 
-	uint32_t shading_rate(int pixels_x, int pixels_y);
 	pipeline_t & ensure_pipeline(size_t view, vk::Sampler rgb, vk::Sampler a);
 
 public:
+	struct input
+	{
+		vk::ImageView rgb;
+		vk::Sampler sampler_rgb;
+		vk::Rect2D rect_rgb;
+		vk::ImageLayout layout_rgb;
+		vk::ImageView a;
+		vk::Sampler sampler_a;
+		vk::Rect2D rect_a;
+		vk::ImageLayout layout_a;
+	};
+
 	stream_defoveator(
 	        vk::raii::Device & device,
 	        vk::raii::PhysicalDevice & physical_device,
@@ -78,11 +81,15 @@ public:
 
 	stream_defoveator(const stream_defoveator &) = delete;
 
+	void reset_pipelines();
+
 	void defoveate(
 	        vk::raii::CommandBuffer & command_buffer,
 	        const std::array<wivrn::to_headset::foveation_parameter, 2> & foveation,
-	        std::span<wivrn::blitter::output> inputs,
+	        const std::array<input, 2> & inputs,
+	        std::array<float, 4> scale,
+	        std::array<float, 4> bias,
 	        int destination);
 
-	XrExtent2Di defoveated_size(const wivrn::to_headset::foveation_parameter &) const;
+	static XrExtent2Di defoveated_size(const wivrn::to_headset::foveation_parameter &);
 };

@@ -80,6 +80,7 @@ body:
     attributes:
       label: Vulkan Info
       description: Provide the output of `vulkaninfo --summary` command.
+      render: text
       placeholder: Attach the output as a file here.
 
   - type: dropdown
@@ -106,4 +107,5 @@ body:
     attributes:
       label: ADB Logs
       description: Provide the output of `adb logcat` command.
+      render: plain
       placeholder: Attach the output of adb logcat as a file.

@@ -30,27 +30,30 @@
 
 namespace xr
 {
+class instance;
 class session;
 
 class swapchain : public utils::handle<XrSwapchain, xrDestroySwapchain>
 {
-public:
-	struct image
-	{
-		vk::Image image{};
-	};
-
 private:
 	int32_t width_;
 	int32_t height_;
 	int sample_count_;
 	vk::Format format_;
 
-	std::vector<image> images_;
+	std::vector<vk::Image> images_;
 
 public:
 	swapchain() = default;
-	swapchain(session &, vk::raii::Device & device, vk::Format format, int32_t width, int32_t height, int sample_count = 1, uint32_t array_size = 1);
+	swapchain(
+	        instance &,
+	        session &,
+	        vk::raii::Device & device,
+	        vk::Format format,
+	        int32_t width,
+	        int32_t height,
+	        int sample_count = 1,
+	        uint32_t array_size = 1);
 
 	int32_t width() const
 	{
@@ -68,13 +71,13 @@ public:
 	{
 		return sample_count_;
 	}
-	const std::vector<image> & images() const
+	const std::vector<vk::Image> & images() const
 	{
 		return images_;
 	}
-	std::vector<image> & images()
+	vk::Image image(size_t i) const
 	{
-		return images_;
+		return images_[i];
 	}
 	vk::Format format() const
 	{

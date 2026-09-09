@@ -18,11 +18,19 @@ Kirigami.ScrollablePage {
 
         TroubleshootCard {
             title: i18n("I cannot find the WiVRn app on my headset")
-            details: i18n("If you installed WiVRn over USB on a Meta headset, the app is in the \"unknown sources\" section.")
+            details: i18n("If you installed WiVRn over USB on a Meta or Pico headset, the app is in the \"unknown sources\" section.")
         }
         TroubleshootCard {
             title: i18n("I cannot see my computer in the WiVRn app")
-            details: i18n("If the server is not visible or the connection fails, check that port 5353 (UDP) and 9757 (TCP and UDP) are open in your firewall.")
+            details: i18n("If you have a firewall, make sure that port 5353/UDP is open.")
+        }
+        TroubleshootCard {
+            title: i18n("Connecting remains stuck on \"Connection to ...\"")
+            details: i18n("If you have a firewall, make sure that port 9757 is open both for TCP and UDP.")
+        }
+        TroubleshootCard {
+            title: i18n("Connection fails with \"no route to host\"")
+            details: i18n("If you have a firewall, make sure that port 9757 is open both for TCP and UDP.")
         }
         TroubleshootCard {
             title: i18n("I have an \"Incompatible WiVRn server\" error on my headset")
@@ -48,6 +56,10 @@ Kirigami.ScrollablePage {
         TroubleshootCard {
             title: i18n("I have no sound on my headset")
             details: i18n("When the headset is connected, select \"WiVRn\" as the default audio output device for applications to use it.")
+        }
+        TroubleshootCard {
+            title: i18n("Some games fail to start or have input issues")
+            details: i18n("For game specific issues, check on <a href=\"https://db.vronlinux.org/\">vronlinux DB</a> if there are known bugs or workarounds.")
         }
     }
 
@@ -82,6 +94,6 @@ Kirigami.ScrollablePage {
 
     Shortcut {
         sequences: [StandardKey.Cancel]
-        onActivated: applicationWindow().pageStack.pop()
+        onActivated: {if (isCurrentPage) applicationWindow().pageStack.pop();}
     }
 }

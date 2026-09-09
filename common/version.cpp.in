@@ -17,11 +17,25 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
+#include <cctype>
+#include <iterator>
+
+static const char git_desc[] = "@GIT_DESC@";
+
 namespace wivrn
 {
-	extern const char git_version[];
-	const char git_version[] = "@GIT_DESC@";
 
-	extern const char git_commit[];
-	const char git_commit[] = "@GIT_COMMIT@";
+extern const char git_commit[];
+const char git_commit[] = "@GIT_COMMIT@";
+
+extern const bool is_tag;
+const bool is_tag = @GIT_TAG@;
+
+const char * display_version()
+{
+	if (std::size(git_desc) > 2 and git_desc[0] == 'v' and isdigit(git_desc[1]))
+		return git_desc + 1;
+	else
+		return git_desc;
 }
+} // namespace wivrn

@@ -20,10 +20,12 @@
 
 #include "application.h"
 #include "scenes/stream.h"
+#include "spdlog/spdlog.h"
+#include <format>
 
 namespace
 {
-struct pyrowave_blit_handle : public decoder::blit_handle
+struct pyrowave_blit_handle : public wivrn::decoder::blit_handle
 {
 	std::atomic_bool & free;
 
@@ -32,11 +34,12 @@ struct pyrowave_blit_handle : public decoder::blit_handle
 	        const wivrn::to_headset::video_stream_data_shard::view_info_t & view_info,
 	        vk::ImageView image_view,
 	        vk::Image image,
+	        vk::Extent2D extent,
 	        vk::ImageLayout & current_layout,
 	        vk::Semaphore semaphore,
 	        uint64_t & semaphore_val,
 	        std::atomic_bool & free) :
-	        decoder::blit_handle{feedback, view_info, image_view, image, current_layout, semaphore, &semaphore_val},
+	        wivrn::decoder::blit_handle{feedback, view_info, image_view, image, extent, current_layout, semaphore, &semaphore_val},
 	        free(free) {}
 	~pyrowave_blit_handle()
 	{
@@ -51,16 +54,14 @@ pyrowave_decoder::pyrowave_decoder(
         vk::raii::Device & device,
         vk::raii::PhysicalDevice & physical_device,
         uint32_t vk_queue_family_index,
-        const wivrn::to_headset::video_stream_description::item & description,
-        float fps,
+        const wivrn::to_headset::video_stream_description & description,
         uint8_t stream_index,
         std::weak_ptr<scenes::stream> scene,
         shard_accumulator * accumulator) :
-        decoder(description),
         ycbcr_conversion(device, {
                                          .format = vk::Format::eG8B8R83Plane420Unorm,
-                                         .ycbcrModel = vk::SamplerYcbcrModelConversion(description.color_model.value_or(VK_SAMPLER_YCBCR_MODEL_CONVERSION_YCBCR_709)),
-                                         .ycbcrRange = vk::SamplerYcbcrRange(description.range.value_or(VK_SAMPLER_YCBCR_RANGE_ITU_FULL)),
+                                         .ycbcrModel = vk::SamplerYcbcrModelConversion::eYcbcr709,
+                                         .ycbcrRange = vk::SamplerYcbcrRange::eItuFull,
                                          .chromaFilter = vk::Filter::eNearest,
                                  }),
         sampler_(device, vk::StructureChain{
@@ -78,9 +79,13 @@ pyrowave_decoder::pyrowave_decoder(
                                  },
                          }
                                  .get()),
+        extent{
+                .width = description.width,
+                .height = description.height / (stream_index == 2 ? 2u : 1u),
+        },
         weak_scene(scene),
         accumulator(accumulator),
-        dec(physical_device, device, description.width, description.height, PyroWave::ChromaSubsampling::Chroma420, true)
+        dec(physical_device, device, extent.width, extent.height, PyroWave::ChromaSubsampling::Chroma420, true)
 {
 	std::array formats = {
 	        vk::Format::eR8Unorm,
@@ -101,8 +106,8 @@ pyrowave_decoder::pyrowave_decoder(
 		                .imageType = vk::ImageType::e2D,
 		                .format = formats.back(),
 		                .extent = {
-		                        .width = description.width,
-		                        .height = description.height,
+		                        .width = extent.width,
+		                        .height = extent.height,
 		                        .depth = 1,
 		                },
 		                .mipLevels = 1,
@@ -265,6 +270,7 @@ void pyrowave_decoder::worker_function(uint32_t queue_family_index)
 			        view_info,
 			        *item->view_full,
 			        item->image,
+			        extent,
 			        item->current_layout,
 			        *item->semaphore,
 			        item->semaphore_val,

@@ -25,14 +25,12 @@
 #include <QApplication>
 #include <QClipboard>
 #include <QDesktopServices>
+#include <QTimer>
 #include <QtLogging>
 #include <cassert>
 #include <memory>
 #include <nlohmann/json.hpp>
-
-#if WIVRN_CHECK_CAPSYSNICE
-#include <sys/capability.h>
-#endif
+#include <unistd.h>
 
 #include <vulkan/vulkan.hpp>
 #include <vulkan/vulkan_raii.hpp>
@@ -43,24 +41,6 @@ static QString server_path()
 {
 	return QCoreApplication::applicationDirPath() + "/wivrn-server";
 }
-
-#if WIVRN_CHECK_CAPSYSNICE
-static bool has_cap_sys_nice()
-{
-	auto caps = cap_get_file(server_path().toStdString().c_str());
-
-	if (not caps)
-		return false;
-
-	cap_flag_value_t value{};
-	if (cap_get_flag(caps, CAP_SYS_NICE, CAP_EFFECTIVE, &value) < 0)
-		return false;
-
-	cap_free(caps);
-
-	return value == CAP_SET;
-}
-#endif
 
 wivrn_server::wivrn_server(QObject * parent) :
         QObject(parent)
@@ -73,13 +53,14 @@ wivrn_server::wivrn_server(QObject * parent) :
 
 	const QStringList services = QDBusConnection::sessionBus().interface()->registeredServiceNames();
 	if (services.contains("io.github.wivrn.Server"))
+	{
+		// Server is already up. Move to a transitional state so Main.qml's
+		// onCompleted does not see Status::Stopped and spawn a duplicate
+		// process. The state will transition to Started after the initial
+		// properties have been fetched (see refresh_server_properties).
+		m_serverStatus = Status::Starting;
 		on_server_dbus_registered();
-
-#if WIVRN_CHECK_CAPSYSNICE
-	m_capSysNice = has_cap_sys_nice();
-#else
-	m_capSysNice = true;
-#endif
+	}
 }
 
 wivrn_server::~wivrn_server()
@@ -164,10 +145,12 @@ void wivrn_server::start_server()
 						qDebug() << "Server finished before registering on dbus";
 						serverStatusChanged(m_serverStatus = Status::FailedToStart);
 					}
+					ownServerChanged();
 				}
 			});
 
 			server_process->start(server_path(), QApplication::arguments().mid(1));
+			ownServerChanged();
 		}
 
 		break;
@@ -245,8 +228,6 @@ void wivrn_server::on_server_ready_read_standard_output()
 
 void wivrn_server::on_server_dbus_registered()
 {
-	serverStatusChanged(m_serverStatus = Status::Started);
-
 	if (server_interface)
 		server_interface->deleteLater();
 	if (server_properties_interface)
@@ -256,8 +237,13 @@ void wivrn_server::on_server_dbus_registered()
 	server_properties_interface = std::make_unique<OrgFreedesktopDBusPropertiesInterface>("io.github.wivrn.Server", "/io/github/wivrn/Server", QDBusConnection::sessionBus(), this);
 
 	connect(server_properties_interface.get(), &OrgFreedesktopDBusPropertiesInterface::PropertiesChanged, this, &wivrn_server::on_server_properties_changed);
+	connect(server_interface.get(), &IoGithubWivrnServerInterface::ServerError, [this](const QString & w, const QString & m) { serverError(serverErrorData(w, m)); });
 
-	serverStatusChanged(m_serverStatus = Status::Started);
+	// Server status transitions to Started only after refresh_server_properties
+	// successfully fetches the initial properties. The well-known D-Bus name
+	// can be owned before the server exports its interface and populates the
+	// properties (see on_name_acquired in server/main.cpp), so the name being
+	// owned alone does not mean the server is usable yet.
 	refresh_server_properties();
 }
 
@@ -278,52 +264,14 @@ void wivrn_server::on_server_dbus_unregistered()
 	if (isHeadsetConnected())
 		headsetConnectedChanged(m_headsetConnected = false);
 
+	if (isSessionRunning())
+		sessionRunningChanged(m_sessionRunning = false);
+
 	if (isPairingEnabled())
 		pairingEnabledChanged(m_isPairingEnabled = false);
 
 	if (serverStatus() == Status::Restarting)
 		start_server();
-}
-
-void wivrn_server::grant_cap_sys_nice()
-{
-#if WIVRN_CHECK_CAPSYSNICE
-	if (not setcap_process)
-	{
-		setcap_process = std::make_unique<QProcess>();
-		setcap_process->setProgram("pkexec");
-		setcap_process->setArguments({"setcap", "CAP_SYS_NICE=+ep", server_path()});
-		setcap_process->setProcessChannelMode(QProcess::MergedChannels);
-		setcap_process->start();
-
-		QObject::connect(setcap_process.get(), &QProcess::finished, this, [this](int exit_code, QProcess::ExitStatus exit_status) {
-			// Exit codes:
-			// 0: setcap successful
-			// 1: setcap failed
-			// 126: pkexec: not authorized or authentication error
-			// 127: pkexec: dismissed by user
-
-			if (exit_status == QProcess::NormalExit and exit_code == 0)
-			{
-				if (not has_cap_sys_nice())
-				{
-					qDebug() << "pkexec setcap returned successfully but the server does not have the CAP_SYS_NICE capability";
-				}
-				else
-				{
-					qDebug() << "setcap sucessful";
-					capSysNiceChanged(m_capSysNice = true);
-				}
-			}
-			else
-			{
-				qWarning() << "setcap exited with status" << exit_status << "and code" << exit_code;
-			}
-
-			setcap_process.release()->deleteLater();
-		});
-	}
-#endif
 }
 
 void wivrn_server::open_server_logs()
@@ -345,7 +293,22 @@ void wivrn_server::refresh_server_properties()
 	get_all_properties_call_watcher = std::make_unique<QDBusPendingCallWatcher>(props_pending, this);
 
 	connect(get_all_properties_call_watcher.get(), &QDBusPendingCallWatcher::finished, [this, props_pending]() {
-		on_server_properties_changed("io.github.wivrn.Server", props_pending.value(), {});
+		QVariantMap props = props_pending.value();
+		// The server only exports the D-Bus interface and sets its properties
+		// from inside on_name_acquired (server/main.cpp), after it owns the
+		// well-known name. Our GetAll can race ahead of that and come back
+		// with an error or an empty reply that does not contain
+		// JsonConfiguration. In that case, retry shortly after until the
+		// properties become available.
+		if (props_pending.isError() || !props.contains("JsonConfiguration"))
+		{
+			QTimer::singleShot(200, this, &wivrn_server::refresh_server_properties);
+			return;
+		}
+		on_server_properties_changed("io.github.wivrn.Server", props, {});
+
+		if (m_serverStatus != Status::Started)
+			serverStatusChanged(m_serverStatus = Status::Started);
 	});
 }
 
@@ -357,6 +320,11 @@ void wivrn_server::on_server_properties_changed(const QString & interface_name, 
 	if (changed_properties.contains("HeadsetConnected"))
 	{
 		headsetConnectedChanged(m_headsetConnected = changed_properties["HeadsetConnected"].toBool());
+	}
+
+	if (changed_properties.contains("SessionRunning"))
+	{
+		sessionRunningChanged(m_sessionRunning = changed_properties["SessionRunning"].toBool());
 	}
 
 	if (changed_properties.contains("JsonConfiguration"))
@@ -496,6 +464,11 @@ void wivrn_server::on_server_properties_changed(const QString & interface_name, 
 	if (changed_properties.contains("SupportedCodecs"))
 	{
 		supportedCodecsChanged(m_supportedCodecs = changed_properties["SupportedCodecs"].toStringList());
+	}
+
+	if (changed_properties.contains("SystemName"))
+	{
+		systemNameChanged(m_systemName = changed_properties["SystemName"].toString());
 	}
 
 	if (changed_properties.contains("SteamCommand"))

@@ -55,7 +55,7 @@ private:
 	std::string pin;
 	encryption_state state;
 
-	wivrn::from_headset::headset_info_packet info_packet;
+	from_headset::headset_info_packet info_packet;
 
 	void init(std::stop_token stop_token, std::function<void()> tick = []() {});
 
@@ -64,11 +64,16 @@ public:
 	wivrn_connection(const wivrn_connection &) = delete;
 	wivrn_connection & operator=(const wivrn_connection &) = delete;
 
+	bool has_stream() const
+	{
+		return stream;
+	}
+
 	bool is_active()
 	{
 		return active;
 	}
-	void reset(TCP && tcp, std::function<void()> tick = []() {});
+	void reset(std::stop_token stop, TCP && tcp, std::function<void()> tick = {});
 	void shutdown();
 
 	template <typename T>
@@ -108,7 +113,7 @@ public:
 
 	std::optional<from_headset::packets> poll_control(int timeout);
 
-	const wivrn::from_headset::headset_info_packet & info() const
+	const from_headset::headset_info_packet & info()
 	{
 		return info_packet;
 	}

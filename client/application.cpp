@@ -18,27 +18,28 @@
  */
 
 #include "application.h"
-#include "asset.h"
-#include "hardware.h"
+
 #include "openxr/openxr.h"
 #include "scene.h"
 #include "spdlog/common.h"
 #include "spdlog/spdlog.h"
+#include "utils/class_from_member.h"
 #include "utils/contains.h"
 #include "utils/files.h"
+#include "utils/i18n.h"
 #include "vk/check.h"
 #include "wifi_lock.h"
-#include "wivrn_packets.h"
+#include "wivrn_config.h"
 #include "xr/actionset.h"
 #include "xr/check.h"
 #include "xr/htc_exts.h"
 #include "xr/htc_face_tracker.h"
-#include "xr/meta_body_tracking_fidelity.h"
 #include "xr/to_string.h"
 #include <algorithm>
 #include <boost/locale.hpp>
 #include <boost/url/parse.hpp>
 #include <chrono>
+#include <cstring>
 #include <ctype.h>
 #include <exception>
 #include <magic_enum.hpp>
@@ -69,7 +70,7 @@ using namespace std::chrono_literals;
 struct interaction_profile
 {
 	std::string profile_name;
-	std::vector<std::string> required_extensions;
+	std::vector<const char *> required_extensions;
 	XrVersion min_version = XR_MAKE_VERSION(1, 0, 0);
 	std::vector<std::string> input_sources;
 	bool available;
@@ -477,6 +478,47 @@ static std::vector<interaction_profile> interaction_profiles{
                 },
         },
         interaction_profile{
+                .profile_name = "/interaction_profiles/yvr/touch_controller_yvr",
+                .input_sources = {
+                        "/user/hand/left/output/haptic",
+                        "/user/hand/right/output/haptic",
+
+                        "/user/hand/left/input/grip/pose",
+                        "/user/hand/left/input/aim/pose",
+
+                        "/user/hand/right/input/grip/pose",
+                        "/user/hand/right/input/aim/pose",
+
+                        "/user/hand/left/input/x/click",
+                        "/user/hand/left/input/x/touch",
+                        "/user/hand/left/input/y/click",
+                        "/user/hand/left/input/y/touch",
+                        "/user/hand/left/input/menu/click",
+                        "/user/hand/left/input/squeeze/value",
+                        "/user/hand/left/input/squeeze/click",
+                        "/user/hand/left/input/trigger/value",
+                        "/user/hand/left/input/trigger/touch",
+                        "/user/hand/left/input/thumbstick",
+                        "/user/hand/left/input/thumbstick/click",
+                        "/user/hand/left/input/thumbstick/touch",
+                        "/user/hand/left/input/thumbrest/touch",
+
+                        "/user/hand/right/input/a/click",
+                        "/user/hand/right/input/a/touch",
+                        "/user/hand/right/input/b/click",
+                        "/user/hand/right/input/b/touch",
+                        "/user/hand/right/input/system/click",
+                        "/user/hand/right/input/squeeze/value",
+                        "/user/hand/right/input/squeeze/click",
+                        "/user/hand/right/input/trigger/value",
+                        "/user/hand/right/input/trigger/touch",
+                        "/user/hand/right/input/thumbstick",
+                        "/user/hand/right/input/thumbstick/click",
+                        "/user/hand/right/input/thumbstick/touch",
+                        "/user/hand/right/input/thumbrest/touch",
+                },
+        },
+        interaction_profile{
                 .profile_name = "/interaction_profiles/htc/vive_focus3_controller",
                 .required_extensions = {XR_HTC_VIVE_FOCUS3_CONTROLLER_INTERACTION_EXTENSION_NAME},
                 .input_sources = {
@@ -561,6 +603,35 @@ static std::vector<interaction_profile> interaction_profiles{
                         "/user/eyes_ext/input/gaze_ext/pose",
                 },
         },
+        interaction_profile{
+                .profile_name = "/interaction_profiles/microsoft/xbox_controller",
+                .input_sources = {
+                        "/user/gamepad/input/menu/click",
+                        "/user/gamepad/input/view/click",
+                        "/user/gamepad/input/a/click",
+                        "/user/gamepad/input/b/click",
+                        "/user/gamepad/input/x/click",
+                        "/user/gamepad/input/y/click",
+                        "/user/gamepad/input/dpad_up/click",
+                        "/user/gamepad/input/dpad_down/click",
+                        "/user/gamepad/input/dpad_left/click",
+                        "/user/gamepad/input/dpad_right/click",
+                        "/user/gamepad/input/shoulder_left/click",
+                        "/user/gamepad/input/shoulder_right/click",
+                        "/user/gamepad/input/thumbstick_left/click",
+                        "/user/gamepad/input/thumbstick_right/click",
+                        "/user/gamepad/input/trigger_left/value",
+                        "/user/gamepad/input/trigger_right/value",
+                        "/user/gamepad/input/thumbstick_left/x",
+                        "/user/gamepad/input/thumbstick_left/y",
+                        "/user/gamepad/input/thumbstick_right/x",
+                        "/user/gamepad/input/thumbstick_right/y",
+                        "/user/gamepad/output/haptic_left",
+                        "/user/gamepad/output/haptic_right",
+                        "/user/gamepad/output/haptic_left_trigger",
+                        "/user/gamepad/output/haptic_right_trigger",
+                },
+        },
 };
 
 static const std::pair<std::string_view, XrActionType> action_suffixes[] =
@@ -593,11 +664,15 @@ static const std::pair<std::string_view, XrActionType> action_suffixes[] =
 		{"/ready_ext", XR_ACTION_TYPE_BOOLEAN_INPUT},
 
 		// Output paths
-		{"/haptic",           XR_ACTION_TYPE_VIBRATION_OUTPUT},
-		{"/haptic_trigger",   XR_ACTION_TYPE_VIBRATION_OUTPUT},
-		{"/haptic_trigger_fb",XR_ACTION_TYPE_VIBRATION_OUTPUT},
-		{"/haptic_thumb",     XR_ACTION_TYPE_VIBRATION_OUTPUT},
-		{"/haptic_thumb_fb",  XR_ACTION_TYPE_VIBRATION_OUTPUT},
+		{"/haptic",              XR_ACTION_TYPE_VIBRATION_OUTPUT},
+		{"/haptic_trigger",      XR_ACTION_TYPE_VIBRATION_OUTPUT},
+		{"/haptic_trigger_fb",   XR_ACTION_TYPE_VIBRATION_OUTPUT},
+		{"/haptic_thumb",        XR_ACTION_TYPE_VIBRATION_OUTPUT},
+		{"/haptic_thumb_fb",     XR_ACTION_TYPE_VIBRATION_OUTPUT},
+		{"/haptic_left",         XR_ACTION_TYPE_VIBRATION_OUTPUT},
+		{"/haptic_right",        XR_ACTION_TYPE_VIBRATION_OUTPUT},
+		{"/haptic_left_trigger", XR_ACTION_TYPE_VIBRATION_OUTPUT},
+		{"/haptic_right_trigger",XR_ACTION_TYPE_VIBRATION_OUTPUT},
                 // clang-format on
 };
 
@@ -720,11 +795,13 @@ void application::initialize_vulkan()
 		}
 	}
 #ifndef NDEBUG
+#ifdef __ANDROID__
 	if (validation_layer_found)
 	{
 		spdlog::info("Using Vulkan validation layer");
 		layers.push_back("VK_LAYER_KHRONOS_validation");
 	}
+#endif
 	bool debug_report_found = false;
 	bool debug_utils_found = false;
 #endif
@@ -745,26 +822,25 @@ void application::initialize_vulkan()
 			instance_extensions.push_back(VK_EXT_DEBUG_REPORT_EXTENSION_NAME);
 		}
 
-		if (!strcmp(i.extensionName, VK_EXT_DEBUG_UTILS_EXTENSION_NAME) and
-		    guess_model() != model::oculus_quest) // Quest 1 lies, the extension won't load
+		if (!strcmp(i.extensionName, VK_EXT_DEBUG_UTILS_EXTENSION_NAME) and get_hmd_traits().vk_debug_ext_allowed)
 		{
 			debug_utils_found = true;
 			instance_extensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
 		}
 #endif
 	}
-	std::ranges::sort(extensions);
-	for (const auto & [extension_name, spec_version]: extensions)
-		spdlog::info("    {} (version {})", extension_name, spec_version);
 
 	vk_device_extensions.push_back(VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME);
+	vk_device_extensions.push_back(VK_KHR_SAMPLER_YCBCR_CONVERSION_EXTENSION_NAME);
+	vk_device_extensions.push_back(VK_KHR_MULTIVIEW_EXTENSION_NAME);
+	optional_device_extensions.emplace(VK_EXT_INDEX_TYPE_UINT8_EXTENSION_NAME);
 	optional_device_extensions.emplace(VK_KHR_8BIT_STORAGE_EXTENSION_NAME);
+	optional_device_extensions.emplace(VK_KHR_16BIT_STORAGE_EXTENSION_NAME);
 	optional_device_extensions.emplace(VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME);
 	optional_device_extensions.emplace(VK_KHR_SHADER_FLOAT16_INT8_EXTENSION_NAME);
-	optional_device_extensions.emplace(VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME);
 	optional_device_extensions.emplace(VK_IMG_FILTER_CUBIC_EXTENSION_NAME);
-	optional_device_extensions.emplace(VK_KHR_CREATE_RENDERPASS_2_EXTENSION_NAME);
-	optional_device_extensions.emplace(VK_KHR_FRAGMENT_SHADING_RATE_EXTENSION_NAME);
+	optional_device_extensions.emplace(VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME);
+	optional_device_extensions.emplace(VK_EXT_FRAGMENT_DENSITY_MAP_EXTENSION_NAME);
 
 #ifdef __ANDROID__
 	vk_device_extensions.push_back(VK_ANDROID_EXTERNAL_MEMORY_ANDROID_HARDWARE_BUFFER_EXTENSION_NAME);
@@ -777,6 +853,19 @@ void application::initialize_vulkan()
 	instance_extensions.push_back(VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME);
 	instance_extensions.push_back(VK_KHR_EXTERNAL_MEMORY_CAPABILITIES_EXTENSION_NAME);
 #endif
+
+	std::ranges::sort(extensions);
+	for (const auto & [extension_name, spec_version]: extensions)
+	{
+		if (runtime_hmd_traits.blacklisted_extensions.contains(extension_name))
+		{
+			spdlog::info("    {} (version {}) (blacklisted)", extension_name, spec_version);
+			if (std::ranges::find(instance_extensions, extension_name) != instance_extensions.end())
+				throw std::runtime_error("Required Vulkan instance extension is blacklisted");
+		}
+		else
+			spdlog::info("    {} (version {})", extension_name, spec_version);
+	}
 
 	vk::ApplicationInfo application_info{
 	        .pApplicationName = app_info.name.c_str(),
@@ -837,9 +926,19 @@ void application::initialize_vulkan()
 	spdlog::info("Available Vulkan device extensions:");
 	for (const auto & [extension_name, spec_version]: extensions)
 	{
-		spdlog::info("    {} (version {})", extension_name, spec_version);
-		if (auto it = optional_device_extensions.find(extension_name); it != optional_device_extensions.end())
-			vk_device_extensions.push_back(it->data());
+		if (runtime_hmd_traits.blacklisted_extensions.contains(extension_name))
+		{
+			spdlog::info("    {} (version {}) (blacklisted)", extension_name, spec_version);
+
+			if (std::ranges::find(vk_device_extensions, extension_name) != instance_extensions.end())
+				throw std::runtime_error("Required Vulkan device extension is blacklisted");
+		}
+		else
+		{
+			spdlog::info("    {} (version {})", extension_name, spec_version);
+			if (auto it = optional_device_extensions.find(extension_name); it != optional_device_extensions.end())
+				vk_device_extensions.push_back(it->data());
+		}
 	}
 
 	spdlog::info("Initializing Vulkan with device {}", physical_device_properties.deviceName.data());
@@ -883,76 +982,42 @@ void application::initialize_vulkan()
 	                .ppEnabledExtensionNames = vk_device_extensions.data(),
 	                .pEnabledFeatures = &device_features,
 	        },
-	        vk::PhysicalDeviceVulkan11Features{},
-	        vk::PhysicalDeviceFragmentShadingRateFeaturesKHR{},
-	        vk::PhysicalDevice8BitStorageFeatures{
-	                .storageBuffer8BitAccess = true,
+	        vk::PhysicalDeviceSamplerYcbcrConversionFeaturesKHR{
+	                .samplerYcbcrConversion = true,
 	        },
-	        vk::PhysicalDeviceSubgroupSizeControlFeaturesEXT{
-	                .subgroupSizeControl = true,
-	                .computeFullSubgroups = true,
+	        vk::PhysicalDeviceTimelineSemaphoreFeaturesKHR{},
+	        vk::PhysicalDeviceMultiviewFeaturesKHR{
+	                .multiview = true,
 	        },
-	        vk::PhysicalDeviceFloat16Int8FeaturesKHR{
-	                .shaderFloat16 = true,
-	        },
-	        vk::PhysicalDeviceTimelineSemaphoreFeaturesKHR{
-	                .timelineSemaphore = true,
-	        },
+	        vk::PhysicalDeviceIndexTypeUint8FeaturesEXT{},
+	        vk::PhysicalDevice8BitStorageFeaturesKHR{},
+	        vk::PhysicalDevice16BitStorageFeaturesKHR{},
+	        vk::PhysicalDeviceShaderFloat16Int8FeaturesKHR{},
+	        vk::PhysicalDeviceSubgroupSizeControlFeaturesEXT{}};
+
+	auto check_feature_flag = [&](auto feature_flag, const char * extension_name) -> bool {
+		using FeatureStruct = class_from_member_t<decltype(feature_flag)>;
+
+		if (utils::contains(vk_device_extensions, extension_name) and
+		    vk_physical_device.getFeatures2<vk::PhysicalDeviceFeatures2, FeatureStruct>().template get<FeatureStruct>().*feature_flag)
+		{
+			device_create_info.get<FeatureStruct>().*feature_flag = true;
+			return true;
+		}
+		else
+		{
+			device_create_info.unlink<FeatureStruct>();
+			return false;
+		}
 	};
-	device_create_info.unlink<vk::PhysicalDeviceFragmentShadingRateFeaturesKHR>();
-	device_create_info.unlink<vk::PhysicalDevice8BitStorageFeatures>();
-	device_create_info.unlink<vk::PhysicalDeviceSubgroupSizeControlFeaturesEXT>();
-	device_create_info.unlink<vk::PhysicalDeviceFloat16Int8FeaturesKHR>();
-	device_create_info.unlink<vk::PhysicalDeviceTimelineSemaphoreFeaturesKHR>();
 
-	{
-		auto [_, feat] = vk_physical_device.getFeatures2<vk::PhysicalDeviceFeatures2, vk::PhysicalDeviceVulkan11Features>();
-		auto & create_feat = device_create_info.get<vk::PhysicalDeviceVulkan11Features>();
-		create_feat.samplerYcbcrConversion = feat.samplerYcbcrConversion;
-		create_feat.storageBuffer16BitAccess = feat.storageBuffer16BitAccess;
-	}
-
-	if (utils::contains(vk_device_extensions, VK_KHR_CREATE_RENDERPASS_2_EXTENSION_NAME) and
-	    utils::contains(vk_device_extensions, VK_KHR_FRAGMENT_SHADING_RATE_EXTENSION_NAME))
-	{
-		auto [feat, fragment_feat] = vk_physical_device.getFeatures2<vk::PhysicalDeviceFeatures2, vk::PhysicalDeviceFragmentShadingRateFeaturesKHR>();
-		auto & create_feat = device_create_info.get<vk::PhysicalDeviceFragmentShadingRateFeaturesKHR>();
-		create_feat.primitiveFragmentShadingRate = fragment_feat.primitiveFragmentShadingRate;
-		create_feat.attachmentFragmentShadingRate = fragment_feat.attachmentFragmentShadingRate;
-		spdlog::info("Fragment shading rate features: primitive={} attachment={}",
-		             create_feat.primitiveFragmentShadingRate,
-		             create_feat.attachmentFragmentShadingRate);
-		device_create_info.relink<vk::PhysicalDeviceFragmentShadingRateFeaturesKHR>();
-	}
-
-	if (utils::contains(vk_device_extensions, VK_KHR_8BIT_STORAGE_EXTENSION_NAME))
-	{
-		auto [_, feat] = vk_physical_device.getFeatures2<vk::PhysicalDeviceFeatures2, vk::PhysicalDevice8BitStorageFeatures>();
-
-		if (feat.storageBuffer8BitAccess)
-			device_create_info.relink<vk::PhysicalDevice8BitStorageFeatures>();
-	}
-	if (utils::contains(vk_device_extensions, VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME))
-	{
-		auto [_, feat] = vk_physical_device.getFeatures2<vk::PhysicalDeviceFeatures2, vk::PhysicalDeviceSubgroupSizeControlFeatures>();
-
-		if (feat.subgroupSizeControl and feat.computeFullSubgroups)
-			device_create_info.relink<vk::PhysicalDeviceSubgroupSizeControlFeatures>();
-	}
-	if (utils::contains(vk_device_extensions, VK_KHR_SHADER_FLOAT16_INT8_EXTENSION_NAME))
-	{
-		auto [_, feat] = vk_physical_device.getFeatures2<vk::PhysicalDeviceFeatures2, vk::PhysicalDeviceShaderFloat16Int8Features>();
-
-		if (feat.shaderFloat16)
-			device_create_info.relink<vk::PhysicalDeviceShaderFloat16Int8Features>();
-	}
-	if (utils::contains(vk_device_extensions, VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME))
-	{
-		auto [_, feat] = vk_physical_device.getFeatures2<vk::PhysicalDeviceFeatures2, vk::PhysicalDeviceTimelineSemaphoreFeatures>();
-
-		if (feat.timelineSemaphore)
-			device_create_info.relink<vk::PhysicalDeviceTimelineSemaphoreFeatures>();
-	}
+	check_feature_flag(&vk::PhysicalDeviceTimelineSemaphoreFeaturesKHR::timelineSemaphore, VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME);
+	check_feature_flag(&vk::PhysicalDeviceIndexTypeUint8FeaturesEXT::indexTypeUint8, VK_EXT_INDEX_TYPE_UINT8_EXTENSION_NAME);
+	check_feature_flag(&vk::PhysicalDevice8BitStorageFeaturesKHR::storageBuffer8BitAccess, VK_KHR_8BIT_STORAGE_EXTENSION_NAME);
+	check_feature_flag(&vk::PhysicalDevice16BitStorageFeaturesKHR::storageBuffer16BitAccess, VK_KHR_16BIT_STORAGE_EXTENSION_NAME);
+	check_feature_flag(&vk::PhysicalDeviceShaderFloat16Int8FeaturesKHR::shaderFloat16, VK_KHR_SHADER_FLOAT16_INT8_EXTENSION_NAME);
+	if (check_feature_flag(&vk::PhysicalDeviceSubgroupSizeControlFeaturesEXT::subgroupSizeControl, VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME))
+		check_feature_flag(&vk::PhysicalDeviceSubgroupSizeControlFeaturesEXT::computeFullSubgroups, VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME);
 
 	vk_device = xr_system_id.create_device(vk_physical_device, device_create_info.get());
 	*vk_queue.lock() = vk_device.getQueue(vk_queue_family_index, 0);
@@ -1047,21 +1112,8 @@ void application::initialize_actions()
 		profile.available = std::ranges::all_of(profile.required_extensions, [&](auto & ext) { return xr_instance.has_extension(ext); }) and
 		                    profile.min_version <= api_version;
 
-		if (profile.profile_name.ends_with("khr/simple_controller"))
-		{
-			switch (guess_model())
-			{
-				// Quest hand tracking creates a fake khr/simple_controller when hand tracking
-				// is enabled, this messes with native hand tracking
-				case model::meta_quest_3:
-				case model::meta_quest_pro:
-				case model::meta_quest_3s:
-				case model::oculus_quest_2:
-					profile.available = false;
-				default:
-					break;
-			}
-		}
+		if (profile.profile_name.ends_with("khr/simple_controller") and not get_hmd_traits().bind_simple_controller)
+			profile.available = false;
 
 		if (!profile.available)
 			continue;
@@ -1069,21 +1121,8 @@ void application::initialize_actions()
 		// Patch profile to add grip_surface or palm_ext
 		bool add_palms = true;
 		if (profile.profile_name.ends_with("ext/hand_interaction_ext"))
-		{
-			switch (guess_model())
-			{
-				// Quest breaks spec and does not support grip_surface for ext/hand_interaction_ext
-				case model::meta_quest_3:
-				case model::meta_quest_pro:
-				case model::meta_quest_3s:
-				case model::oculus_quest_2:
-				case model::oculus_quest:
-					add_palms = false;
-					break;
-				default:
-					break;
-			}
-		}
+			add_palms = get_hmd_traits().hand_interaction_grip_surface;
+
 		if (add_palms)
 		{
 			if ((api_version >= XR_MAKE_VERSION(1, 1, 0) or xr_instance.has_extension(XR_KHR_MAINTENANCE1_EXTENSION_NAME)) //
@@ -1102,6 +1141,19 @@ void application::initialize_actions()
 				profile.input_sources.push_back("/user/hand/left/input/palm_ext/pose");
 				profile.input_sources.push_back("/user/hand/right/input/palm_ext/pose");
 			}
+		}
+
+		// Patch profile to add pinch_ext/pose and poke_ext/pose
+		if (xr_instance.has_extension(XR_EXT_HAND_INTERACTION_EXTENSION_NAME)             //
+		    and utils::contains(profile.input_sources, "/user/hand/left/input/grip/pose") //
+		    and not utils::contains(profile.input_sources, "/user/hand/left/input/pinch_ext/pose"))
+		{
+			spdlog::info("Adding pinch_ext/pose for interaction profile {}", profile.profile_name);
+			profile.input_sources.push_back("/user/hand/left/input/pinch_ext/pose");
+			profile.input_sources.push_back("/user/hand/right/input/pinch_ext/pose");
+			spdlog::info("Adding poke_ext/pose for interaction profile {}", profile.profile_name);
+			profile.input_sources.push_back("/user/hand/left/input/poke_ext/pose");
+			profile.input_sources.push_back("/user/hand/right/input/poke_ext/pose");
 		}
 
 		// Dynamically add VIVE XR Trackers to the profile if available
@@ -1240,59 +1292,69 @@ void application::initialize_actions()
 
 void application::initialize()
 {
+	runtime_hmd_traits.init();
 	// LogLayersAndExtensions
 	assert(!xr_instance);
-	std::vector<std::string> xr_extensions;
-
-	// Required extensions
-	xr_extensions.push_back(XR_KHR_CONVERT_TIMESPEC_TIME_EXTENSION_NAME);
+	std::vector<const char *> xr_extensions{
+	        // Required extensions
+	        XR_KHR_CONVERT_TIMESPEC_TIME_EXTENSION_NAME,
+	};
 
 	// Optional extensions
-	std::vector<std::string> opt_extensions;
-	opt_extensions.push_back(XR_KHR_LOCATE_SPACES_EXTENSION_NAME);
-	opt_extensions.push_back(XR_KHR_MAINTENANCE1_EXTENSION_NAME);
-	opt_extensions.push_back(XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME);
-	opt_extensions.push_back(XR_EXT_HAND_TRACKING_EXTENSION_NAME);
-	opt_extensions.push_back(XR_EXT_HAND_INTERACTION_EXTENSION_NAME);
-	opt_extensions.push_back(XR_EXT_EYE_GAZE_INTERACTION_EXTENSION_NAME);
-	opt_extensions.push_back(XR_FB_PASSTHROUGH_EXTENSION_NAME);
-	opt_extensions.push_back(XR_HTC_PASSTHROUGH_EXTENSION_NAME);
-	opt_extensions.push_back(XR_HTC_FACIAL_TRACKING_EXTENSION_NAME);
-	opt_extensions.push_back(XR_HTC_PATH_ENUMERATION_EXTENSION_NAME);
-	opt_extensions.push_back(XR_HTC_VIVE_XR_TRACKER_INTERACTION_EXTENSION_NAME);
-	opt_extensions.push_back(XR_FB_FACE_TRACKING2_EXTENSION_NAME);
-	opt_extensions.push_back(XR_FB_BODY_TRACKING_EXTENSION_NAME);
-	opt_extensions.push_back(XR_META_BODY_TRACKING_FULL_BODY_EXTENSION_NAME);
-	opt_extensions.push_back(XR_META_BODY_TRACKING_FIDELITY_EXTENSION_NAME);
-	opt_extensions.push_back(XR_BD_BODY_TRACKING_EXTENSION_NAME);
-	opt_extensions.push_back(XR_EXT_PALM_POSE_EXTENSION_NAME);
-	opt_extensions.push_back(XR_KHR_COMPOSITION_LAYER_DEPTH_EXTENSION_NAME);
-	opt_extensions.push_back(XR_FB_COMPOSITION_LAYER_DEPTH_TEST_EXTENSION_NAME);
-	opt_extensions.push_back(XR_KHR_COMPOSITION_LAYER_COLOR_SCALE_BIAS_EXTENSION_NAME);
-	opt_extensions.push_back(XR_EXT_USER_PRESENCE_EXTENSION_NAME);
-	opt_extensions.push_back(XR_KHR_VISIBILITY_MASK_EXTENSION_NAME);
-	opt_extensions.push_back(XR_FB_COMPOSITION_LAYER_SETTINGS_EXTENSION_NAME);
+	std::vector<const char *> opt_extensions{
+	        XR_KHR_COMPOSITION_LAYER_COLOR_SCALE_BIAS_EXTENSION_NAME,
+	        XR_KHR_COMPOSITION_LAYER_DEPTH_EXTENSION_NAME,
+	        XR_KHR_LOCATE_SPACES_EXTENSION_NAME,
+	        XR_KHR_MAINTENANCE1_EXTENSION_NAME,
+	        XR_KHR_VISIBILITY_MASK_EXTENSION_NAME,
+
+	        XR_EXT_EYE_GAZE_INTERACTION_EXTENSION_NAME,
+	        XR_EXT_HAND_INTERACTION_EXTENSION_NAME,
+	        XR_EXT_HAND_TRACKING_EXTENSION_NAME,
+	        XR_FB_HAND_TRACKING_MESH_EXTENSION_NAME,
+	        XR_EXT_PALM_POSE_EXTENSION_NAME,
+	        XR_EXT_PERFORMANCE_SETTINGS_EXTENSION_NAME,
+	        XR_EXT_USER_PRESENCE_EXTENSION_NAME,
+
+	        XR_ANDROID_FACE_TRACKING_EXTENSION_NAME,
+
+	        XR_BD_BODY_TRACKING_EXTENSION_NAME,
+
+	        XR_FB_BODY_TRACKING_EXTENSION_NAME,
+	        XR_FB_COMPOSITION_LAYER_DEPTH_TEST_EXTENSION_NAME,
+	        XR_FB_COMPOSITION_LAYER_SETTINGS_EXTENSION_NAME,
+	        XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME,
+	        XR_FB_FACE_TRACKING2_EXTENSION_NAME,
+	        XR_FB_PASSTHROUGH_EXTENSION_NAME,
+	        XR_FB_SWAPCHAIN_UPDATE_STATE_EXTENSION_NAME,
+
+	        XR_HTC_PASSTHROUGH_EXTENSION_NAME,
+	        XR_HTC_PATH_ENUMERATION_EXTENSION_NAME,
+	        XR_HTC_FACIAL_TRACKING_EXTENSION_NAME,
+	        XR_HTC_VIVE_XR_TRACKER_INTERACTION_EXTENSION_NAME,
+
+	        XR_META_BODY_TRACKING_FIDELITY_EXTENSION_NAME,
+	        XR_META_BODY_TRACKING_FULL_BODY_EXTENSION_NAME,
+	        XR_META_LOCAL_DIMMING_EXTENSION_NAME,
+	};
 
 	for (const auto & i: interaction_profiles)
 		opt_extensions.insert(opt_extensions.end(), i.required_extensions.begin(), i.required_extensions.end());
 
-	for (const auto & i: xr::instance::extensions())
+	for (const auto & ext: xr::instance::extensions())
 	{
-		if (utils::contains(opt_extensions, i.extensionName))
-			xr_extensions.push_back(i.extensionName);
-	}
-
-	std::vector<const char *> extensions;
-	for (const auto & i: xr_extensions)
-	{
-		extensions.push_back(i.c_str());
+		auto it = std::find_if(opt_extensions.begin(),
+		                       opt_extensions.end(),
+		                       [&ext](const char * i) { return strcmp(i, ext.extensionName) == 0; });
+		if (it != opt_extensions.end() and not runtime_hmd_traits.blacklisted_extensions.contains(ext.extensionName))
+			xr_extensions.push_back(*it);
 	}
 
 #ifdef __ANDROID__
 	xr_instance =
-	        xr::instance(app_info.name, app_info.native_app->activity->vm, app_info.native_app->activity->clazz, extensions);
+	        xr::instance(app_info.name, app_info.native_app->activity->vm, app_info.native_app->activity->clazz, xr_extensions);
 #else
-	xr_instance = xr::instance(app_info.name, extensions);
+	xr_instance = xr::instance(app_info.name, xr_extensions);
 #endif
 
 	spdlog::info("Created OpenXR instance, runtime {}, version {}, API version {}",
@@ -1356,7 +1418,12 @@ void application::initialize()
 	spaces[size_t(xr::spaces::view)] = xr_session.create_reference_space(XR_REFERENCE_SPACE_TYPE_VIEW);
 	spaces[size_t(xr::spaces::world)] = xr_session.create_reference_space(XR_REFERENCE_SPACE_TYPE_STAGE);
 
-	config.emplace(xr_system_id);
+	config.emplace(xr_system_id, xr_session, application::get_config_path() / "client.json");
+	default_config.emplace(xr_system_id, xr_session);
+
+#ifdef __ANDROID__
+	set_usb_networking(config->usb_network);
+#endif
 
 	// HTC face tracker fails if created later
 	// we can destroy it right away, it actually stores static handles
@@ -1380,56 +1447,53 @@ void application::initialize()
 	vk_cmdpool = vk::raii::CommandPool{vk_device, cmdpool_create_info};
 
 	initialize_actions();
+	load_locale();
+}
 
+void application::load_locale()
+{
 	gen.add_messages_domain("wivrn");
 	std::locale loc = gen("");
 
+	messages_info.encoding = "UTF-8";
+	if (config->locale.empty())
+	{
 #ifdef __ANDROID__
-	jni::klass java_util_Locale("java/util/Locale");
-	auto default_locale = java_util_Locale.call<jni::object<"java/util/Locale">>("getDefault");
+		jni::klass java_util_Locale("java/util/Locale");
+		auto default_locale = java_util_Locale.call<jni::object<"java/util/Locale">>("getDefault");
 
-	// if (auto language = default_locale.call<jni::string>("toString"))
-	if (auto language = default_locale.call<jni::string>("getLanguage"))
-		messages_info.language = language;
+		// if (auto language = default_locale.call<jni::string>("toString"))
+		if (auto language = default_locale.call<jni::string>("getLanguage"))
+			messages_info.language = language;
 
-	if (auto country = default_locale.call<jni::string>("getCountry"))
-		messages_info.country = country;
-
-	messages_info.encoding = "UTF-8";
-
+		if (auto country = default_locale.call<jni::string>("getCountry"))
+			messages_info.country = country;
 #else
-	auto & facet = std::use_facet<boost::locale::info>(loc);
-	messages_info.language = facet.language();
-	messages_info.country = facet.country();
-	messages_info.encoding = "UTF-8";
+		auto & facet = std::use_facet<boost::locale::info>(loc);
+		messages_info.language = facet.language();
+		messages_info.country = facet.country();
 #endif
+	}
+	else
+	{
+		auto pos = config->locale.find("_");
+		messages_info.language = config->locale.substr(0, pos);
+		if (pos != std::string::npos)
+			messages_info.country = config->locale.substr(pos + 1);
+	}
 
 	spdlog::info("Current locale: language {}, country {}, encoding {}", messages_info.language, messages_info.country, messages_info.encoding);
 
 	messages_info.paths.push_back("locale");
 
 	messages_info.domains.push_back(boost::locale::gnu_gettext::messages_info::domain("wivrn"));
-	messages_info.callback = [](const std::string & file_name, const std::string & encoding) {
-		std::vector<char> buffer;
-		try
-		{
-			asset file(file_name);
-			buffer.resize(file.size());
-			memcpy(buffer.data(), file.data(), file.size());
-		}
-		catch (...)
-		{
-		}
-
-		return buffer;
-	};
-
+	messages_info.callback = open_locale_file;
 	loc = std::locale(loc, boost::locale::gnu_gettext::create_messages_facet<char>(messages_info));
 
 	std::locale::global(loc);
 }
 
-std::pair<XrAction, XrActionType> application::get_action(const std::string & requested_name)
+std::pair<XrAction, XrActionType> application::get_action(std::string_view requested_name)
 {
 	for (const auto & [action, type, name]: instance().actions)
 	{
@@ -1441,7 +1505,7 @@ std::pair<XrAction, XrActionType> application::get_action(const std::string & re
 }
 
 #ifdef __ANDROID__
-extern "C" __attribute__((visibility("default"))) void Java_org_meumeu_wivrn_MainActivity_onNewIntent(JNIEnv * env, jobject instance, jobject intent_obj)
+extern "C" void Java_org_meumeu_wivrn_MainActivity_onNewIntent(JNIEnv * env, jobject instance, jobject intent_obj)
 {
 	jni::jni_thread::setup_thread(env);
 	jni::object<"android/content/Intent"> intent{intent_obj};
@@ -1549,6 +1613,26 @@ application::application(application_info info) :
 		}
 	};
 
+	// capture pointer to receive relative mouse events
+	app_info.native_app->activity->callbacks->onWindowFocusChanged = [](ANativeActivity * activity, int has_focus) {
+		if (has_focus)
+			android_hid::request_pointer_capture(activity);
+		else
+			android_hid::release_pointer_capture(activity);
+	};
+
+	app_info.native_app->onInputEvent = [](android_app * app, AInputEvent * event) {
+		auto app_instance = static_cast<application *>(app->userData);
+
+		std::unique_lock _{app_instance->scene_stack_lock};
+		if (!app_instance->scene_stack.empty())
+		{
+			auto scene = app_instance->scene_stack.back();
+			return app_instance->input_handler.handle_input(scene.get(), event) ? 1 : 0;
+		}
+		return 0;
+	};
+
 	wifi = wifi_lock::make_wifi_lock(app_info.native_app->activity->clazz);
 
 	// Initialize the loader for this platform
@@ -1611,6 +1695,9 @@ void application::cleanup()
 
 #ifdef __ANDROID__
 	jni::jni_thread::detach();
+	app_info.native_app->onAppCmd = nullptr;
+	app_info.native_app->onInputEvent = nullptr;
+	app_info.native_app->userData = nullptr;
 #endif
 }
 
@@ -1627,15 +1714,21 @@ void application::loop()
 	poll_events();
 
 	auto scene = current_scene();
-	if (!is_session_running())
+	if (not is_session_running())
 	{
-		if (scene)
+		if (not timestamp_unsynchronized)
+			timestamp_unsynchronized = std::chrono::steady_clock::now();
+
+		if (scene and std::chrono::steady_clock::now() - *timestamp_unsynchronized > 3s)
 			scene->set_focused(false);
+
 		// Throttle loop since xrWaitFrame won't be called.
 		std::this_thread::sleep_for(250ms);
 	}
 	else
 	{
+		timestamp_unsynchronized.reset();
+
 		if (scene)
 		{
 			poll_actions();
@@ -1658,6 +1751,7 @@ void application::loop()
 		}
 		else
 		{
+			spdlog::info("Last scene was popped");
 			exit_requested = true;
 		}
 	}
@@ -1686,6 +1780,7 @@ void application::run()
 				exit_requested = true;
 			}
 		}
+		spdlog::info("Exiting application_thread");
 	});
 
 	// Read all pending events.
@@ -1698,23 +1793,27 @@ void application::run()
 		while (ALooper_pollOnce(100, nullptr, &events, (void **)&source) >= 0)
 		{
 			// Process this event.
-			if (source != nullptr)
-				source->process(app_info.native_app, source);
+			if (source == nullptr)
+				continue;
+
+			source->process(app_info.native_app, source);
 		}
 
 		if (app_info.native_app->destroyRequested)
 		{
+			spdlog::info("app_info.native_app->destroyRequested is true");
 			exit_requested = true;
 		}
 	}
+
+	spdlog::info("Exiting normally");
 
 	application_thread.join();
 }
 #else
 void application::run()
 {
-	struct sigaction act
-	{};
+	struct sigaction act{};
 	act.sa_handler = [](int) {
 		instance().exit_requested = true;
 	};
@@ -1748,6 +1847,38 @@ void application::push_scene(std::shared_ptr<scene> s)
 	std::unique_lock _{instance().scene_stack_lock};
 	instance().scene_stack.push_back(std::move(s));
 }
+
+#ifdef __ANDROID__
+void application::set_usb_networking(bool enabled)
+{
+	jni::object<""> act(app_info.native_app->activity->clazz);
+	auto app = act.call<jni::object<"android/app/Application">>("getApplication");
+	auto ctx = app.call<jni::object<"android/content/Context">>("getApplicationContext");
+	auto system_service = ctx.call<jni::object<"java/lang/Object">>("getSystemService", jni::string("connectivity"));
+
+	auto cb = act.field<jni::object<"android/net/ConnectivityManager$NetworkCallback">>("netcb");
+	try
+	{
+		if (enabled)
+		{
+			auto req = jni::new_object<"android/net/NetworkRequest$Builder">()
+			                   .call<jni::object<"android/net/NetworkRequest$Builder">>("removeCapability", jni::Int(12) /*NET_CAPABILITY_INTERNET*/)
+			                   .call<jni::object<"android/net/NetworkRequest$Builder">>("removeCapability", jni::Int(14) /*NET_CAPABILITY_TRUSTED*/)
+			                   .call<jni::object<"android/net/NetworkRequest$Builder">>("addTransportType", jni::Int(8) /*TRANSPORT_USB*/)
+			                   .call<jni::object<"android/net/NetworkRequest">>("build");
+
+			// system_service.call<void>("requestNetwork", req, jni::new_object<"org/meumeu/wivrn/NetworkInfoCallback">());
+			system_service.call<void>("requestNetwork", req, cb);
+		}
+		else
+		{
+			system_service.call<void>("unregisterNetworkCallback", cb);
+		}
+	}
+	catch (...)
+	{}
+}
+#endif
 
 void application::poll_actions()
 {
@@ -1904,6 +2035,7 @@ void application::poll_events()
 		switch (e.header.type)
 		{
 			case XR_TYPE_EVENT_DATA_INSTANCE_LOSS_PENDING: {
+				spdlog::info("Received XR_TYPE_EVENT_DATA_INSTANCE_LOSS_PENDING");
 				exit_requested = true;
 			}
 			break;

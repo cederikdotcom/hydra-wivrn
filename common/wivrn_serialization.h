@@ -29,6 +29,7 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <magic_enum.hpp>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -288,6 +289,11 @@ public:
 		return size;
 	}
 
+	size_t wire_size()
+	{
+		return initial_buffer.size_bytes();
+	}
+
 	template <typename T>
 	void deserialize(T & v)
 	{
@@ -490,6 +496,20 @@ struct serialization_traits<T, std::enable_if_t<std::is_enum_v<T>>>
 	{
 		h.feed("enum");
 		h.feed(sizeof(T) * 8);
+		h.feed("{");
+
+		bool first = true;
+		for (auto [value, name]: magic_enum::enum_entries<T>())
+		{
+			if (not first)
+				h.feed(",");
+			first = false;
+
+			h.feed(name);
+			h.feed("=");
+			h.feed((std::underlying_type_t<T>)value);
+		}
+		h.feed("}");
 	}
 
 	static void serialize(T value, serialization_packet & packet)

@@ -20,11 +20,13 @@
 #include "implot.h"
 
 #include "application.h"
-#include "asset.h"
 #include "constants.h"
 #include "image_loader.h"
 #include "openxr/openxr.h"
+#include "ui_theme.h"
+#include "utils/mapped_file.h"
 #include "utils/ranges.h"
+#include "utils/strings.h"
 #include "vulkan/vulkan_enums.hpp"
 #include "vulkan/vulkan_handles.hpp"
 #include "vulkan/vulkan_to_string.hpp"
@@ -35,6 +37,7 @@
 #include <cmath>
 #include <cstddef>
 #include <glm/gtc/matrix_access.hpp>
+#include <glm/gtc/quaternion.hpp>
 #include <imgui.h>
 #include <imgui_internal.h>
 #include <limits>
@@ -42,8 +45,6 @@
 #include <ranges>
 #include <spdlog/spdlog.h>
 #include <string_view>
-
-#include "IconsFontAwesome6.h"
 
 #ifdef __ANDROID__
 #include <android/font.h>
@@ -146,7 +147,7 @@ static bool in_viewport(const imgui_context::viewport & viewport, ImVec2 positio
 	return true;
 }
 
-static bool window_intersects_viewport(ImGuiWindow * window, imgui_context::viewport & viewport)
+static bool window_intersects_viewport(ImGuiWindow * window, const imgui_context::viewport & viewport)
 {
 	ImRect w{window->Pos.x, window->Pos.y, window->Pos.x + window->Size.x, window->Pos.y + window->Size.y};
 	ImRect v(viewport.vp_origin.x, viewport.vp_origin.y, viewport.vp_origin.x + viewport.vp_size.x, viewport.vp_origin.y + viewport.vp_size.y);
@@ -157,7 +158,7 @@ static bool window_intersects_viewport(ImGuiWindow * window, imgui_context::view
 static float distance_to_window(ImGuiWindow * window, ImVec2 position)
 {
 	if (window->Hidden or not window->Active)
-		return std::numeric_limits<float>::infinity();
+		return std::numeric_limits<float>::max();
 
 	float dx;
 	if (position.x < window->Pos.x)
@@ -178,16 +179,48 @@ static float distance_to_window(ImGuiWindow * window, ImVec2 position)
 	return std::hypot(dx, dy);
 }
 
+static const std::array layout_bindings = {
+        vk::DescriptorSetLayoutBinding{
+                .binding = 0,
+                .descriptorType = vk::DescriptorType::eSampledImage,
+                .descriptorCount = 1,
+                .stageFlags = vk::ShaderStageFlagBits::eFragment,
+        }};
+
+imgui_textures::imgui_textures(
+        vk::raii::PhysicalDevice physical_device,
+        vk::raii::Device & device,
+        uint32_t queue_family_index,
+        thread_safe<vk::raii::Queue> & queue,
+        std::shared_ptr<image_cache_type> image_cache) :
+        physical_device(physical_device),
+        device(device),
+        queue(queue),
+        ds_layout(device, vk::DescriptorSetLayoutCreateInfo{.bindingCount = layout_bindings.size(), .pBindings = layout_bindings.data()}),
+        command_pool(device,
+                     vk::CommandPoolCreateInfo{
+                             .flags = vk::CommandPoolCreateFlagBits::eResetCommandBuffer | vk::CommandPoolCreateFlagBits::eTransient,
+                             .queueFamilyIndex = queue_family_index,
+                     }),
+        image_cache(image_cache),
+        descriptor_pool(device, ds_layout, layout_bindings)
+{
+	if (not image_cache)
+		this->image_cache = std::make_shared<image_cache_type>(device, physical_device, queue, queue_family_index);
+}
+
+imgui_textures::~imgui_textures()
+{
+	device.waitIdle();
+}
+
 std::vector<std::pair<ImVec2, float>> imgui_context::ray_plane_intersection(const imgui_context::controller_state & in) const
 {
-	if (!in.active)
-		return {};
-
 	std::vector<std::pair<ImVec2, float>> intersections;
 
 	for (const auto & i: layers_)
 	{
-		if (i.space != xr::spaces::world)
+		if (i.space != xr::spaces::world or i.tooltip_viewport)
 			continue;
 
 		auto M = glm::transpose(glm::mat3_cast(i.orientation)); // world-to-plane transform
@@ -207,7 +240,10 @@ std::vector<std::pair<ImVec2, float>> imgui_context::ray_plane_intersection(cons
 			// => ray_start.z + distance × ray_dir.z = 0
 			float distance = -ray_start.z / ray_dir.z;
 
-			if (distance < constants::gui::min_pointer_distance)
+			if (distance < constants::gui::min_controller_distance and in.source == ImGuiMouseSource_VRController)
+				continue;
+
+			if (distance < constants::gui::fingertip_distance_touching_thd_lo and in.source == ImGuiMouseSource_VRHandTracking)
 				continue;
 
 			coord.x = ray_start.x + distance * ray_dir.x;
@@ -289,39 +325,28 @@ imgui_context::imgui_frame & imgui_context::get_frame(vk::Image destination)
 	return frame;
 }
 
-static const std::array layout_bindings = {
-        vk::DescriptorSetLayoutBinding{
-                .binding = 0,
-                .descriptorType = vk::DescriptorType::eCombinedImageSampler,
-                .descriptorCount = 1,
-                .stageFlags = vk::ShaderStageFlagBits::eFragment,
-        }};
-
 imgui_context::imgui_context(
         vk::raii::PhysicalDevice physical_device,
         vk::raii::Device & device,
         uint32_t queue_family_index,
         thread_safe<vk::raii::Queue> & queue,
         std::span<controller> controllers_,
-        xr::swapchain & swapchain,
-        std::vector<viewport> layers) :
-        physical_device(physical_device),
-        device(device),
+        xr::swapchain && swapchain_,
+        std::vector<viewport> layers,
+        std::shared_ptr<image_cache_type> image_cache) :
+        imgui_textures(
+                physical_device,
+                device,
+                queue_family_index,
+                queue,
+                image_cache),
         queue_family_index(queue_family_index),
-        queue(queue),
-        ds_layout(device, vk::DescriptorSetLayoutCreateInfo{.bindingCount = layout_bindings.size(), .pBindings = layout_bindings.data()}),
-        descriptor_pool(device, ds_layout, layout_bindings),
-        renderpass(create_renderpass(device, swapchain.format(), true)),
-        command_pool(device,
-                     vk::CommandPoolCreateInfo{
-                             .flags = vk::CommandPoolCreateFlagBits::eResetCommandBuffer | vk::CommandPoolCreateFlagBits::eTransient,
-                             .queueFamilyIndex = queue_family_index,
-                     }),
-        command_buffers(swapchain.images().size()),
-        size(swapchain.extent().width, swapchain.extent().height),
-        format(swapchain.format()),
+        renderpass(create_renderpass(device, swapchain_.format(), true)),
+        command_buffers(swapchain_.images().size()),
+        size(swapchain_.extent().width, swapchain_.extent().height),
+        format(swapchain_.format()),
         layers_(std::move(layers)),
-        swapchain(swapchain),
+        swapchain(std::move(swapchain_)),
         context(ImGui::CreateContext()),
         plot_context(ImPlot::CreateContext()),
         io((ImGui::SetCurrentContext(context), ImGui::GetIO())),
@@ -349,13 +374,15 @@ imgui_context::imgui_context(
 	        .Device = *device,
 	        .QueueFamily = queue_family_index,
 	        .Queue = *queue.get_unsafe(),
-	        .RenderPass = *renderpass,
+	        .DescriptorPoolSize = 100,
 	        .MinImageCount = 2,
 	        .ImageCount = (uint32_t)swapchain.images().size(), // used to cycle between VkBuffers in ImGui_ImplVulkan_RenderDrawData
-	        .MSAASamples = VK_SAMPLE_COUNT_1_BIT,
 	        .PipelineCache = *application::get_pipeline_cache(),
-	        .Subpass = 0,
-	        .DescriptorPoolSize = 100,
+	        .PipelineInfoMain = {
+	                .RenderPass = *renderpass,
+	                .Subpass = 0,
+	                .MSAASamples = VK_SAMPLE_COUNT_1_BIT,
+	        },
 	        .Allocator = nullptr,
 	        .CheckVkResultFn = check_vk_result,
 	};
@@ -490,29 +517,31 @@ static std::vector<std::string> find_font(std::u16string sample_text, const std:
 
 void imgui_context::initialize_fonts()
 {
-	std::u16string sample_text = u"Hello world";
-
-	const auto & locale = application::get_messages_info();
-	auto it = glyph_set_per_language.find(locale.language + "_" + locale.country);
-	if (it == glyph_set_per_language.end())
-		it = glyph_set_per_language.find(locale.language);
-
-	if (it != glyph_set_per_language.end())
-		for (char16_t c: it->second)
-			sample_text += c;
-
-	// Load Fonts
-	auto fonts = find_font(sample_text, application::get_messages_info().language);
-	for (auto & i: fonts)
+	std::vector<std::string> fonts;
+	for (auto & [code, glyphs]: glyph_set_per_language)
 	{
-		spdlog::info("Font {}", i);
+		std::u16string sample_text = u"Hello world";
+
+		for (char16_t c: glyphs)
+			sample_text += c;
+		auto language = code.substr(0, code.find("_"));
+
+		// Load Fonts
+		for (auto && i: find_font(sample_text, language))
+		{
+			spdlog::info("Font for {} {}", code, i);
+			if (not std::ranges::contains(fonts, i))
+				fonts.push_back(std::move(i));
+		}
 	}
 
-	asset font_awesome_regular("Font Awesome 6 Free-Regular-400.otf");
-	asset font_awesome_solid("Font Awesome 6 Free-Solid-900.otf");
+	assert(font_awesome.empty());
+	font_awesome.emplace_back("assets://Font Awesome 7 Free-Regular-400.otf");
+	font_awesome.emplace_back("assets://Font Awesome 7 Free-Solid-900.otf");
+	font_awesome.emplace_back("assets://Font Awesome 7 Brands-Regular-400.otf");
 
 	ImFontConfig config;
-	config.FontDataOwnedByAtlas = false;
+	config.FontDataOwnedByAtlas = true;
 
 	for (auto & font: fonts)
 	{
@@ -521,10 +550,11 @@ void imgui_context::initialize_fonts()
 		config.MergeMode = true;
 	}
 
+	config.FontDataOwnedByAtlas = false;
 	config.MergeMode = true;
 	config.GlyphMinAdvanceX = 40; // Use if you want to make the icon monospaced
-	io.Fonts->AddFontFromMemoryTTF(const_cast<std::byte *>(font_awesome_regular.data()), font_awesome_regular.size(), constants::gui::font_size_small, &config);
-	io.Fonts->AddFontFromMemoryTTF(const_cast<std::byte *>(font_awesome_solid.data()), font_awesome_solid.size(), constants::gui::font_size_small, &config);
+	for (auto & fa: font_awesome)
+		io.Fonts->AddFontFromMemoryTTF(const_cast<std::byte *>(fa.data()), fa.size(), constants::gui::font_size_small, &config);
 }
 
 std::vector<imgui_context::controller_state> imgui_context::read_controllers_state(XrTime display_time)
@@ -533,97 +563,125 @@ std::vector<imgui_context::controller_state> imgui_context::read_controllers_sta
 	size_t new_focused_controller = focused_controller;
 
 	std::vector<controller_state> new_states;
+	new_states.resize(controllers.size());
+	if (not controllers_enabled)
+		return new_states;
+
+	aim_interaction = {1, 1};
 
 	// Get the hand/controller state from OpenXR
-	for (auto && [index, controller]: utils::enumerate(controllers))
+	for (const auto & [controller, state, current_aim_interaction]: std::ranges::zip_view(controllers, new_states, aim_interaction))
 	{
-		auto & [ctrl, state] = controller;
+		const auto & ctrl = controller.first;
+		std::pair<std::optional<ImVec2>, float> index_tip_position{{}, std::numeric_limits<float>::max()};
+		std::pair<std::optional<ImVec2>, float> palm_position{{}, std::numeric_limits<float>::max()};
+		std::pair<std::optional<ImVec2>, float> controller_position{{}, std::numeric_limits<float>::max()};
 
-		controller_state & new_state = new_states.emplace_back();
-
-		if (not controllers_enabled)
-			continue;
-
+		// First hands, so we can set aim_interaction
+		current_aim_interaction = 1;
 		if (ctrl.hand)
 		{
 			if (auto joints = ctrl.hand->locate(world, display_time))
 			{
 				XrHandJointLocationEXT & index_tip = (*joints)[XR_HAND_JOINT_INDEX_TIP_EXT].first;
-				if (index_tip.locationFlags & XR_SPACE_LOCATION_POSITION_TRACKED_BIT)
+				XrHandJointLocationEXT & palm = (*joints)[XR_HAND_JOINT_PALM_EXT].first;
+
+				if (index_tip.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT)
 				{
-					new_state.aim_position = {
-					        index_tip.pose.position.x,
-					        index_tip.pose.position.y,
-					        index_tip.pose.position.z};
-					// aim_orientation is ignored by ray_plane_intersection() for hands
-
-					new_state.active = true;
-					new_state.source = ImGuiMouseSource_VRHandTracking;
+					index_tip_position = compute_pointer_position(controller_state{
+					        .aim_position = {
+					                index_tip.pose.position.x,
+					                index_tip.pose.position.y,
+					                index_tip.pose.position.z,
+					        },
+					        // aim_orientation is ignored by ray_plane_intersection() for hands
+					        .source = ImGuiMouseSource_VRHandTracking,
+					});
 				}
-			}
 
-			continue;
+				if (palm.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT)
+				{
+					palm_position = compute_pointer_position(controller_state{
+					        .aim_position = {
+					                palm.pose.position.x,
+					                palm.pose.position.y,
+					                palm.pose.position.z,
+					        },
+					        .source = ImGuiMouseSource_VRHandTracking,
+					});
+				}
+
+				if (index_tip_position.second < constants::gui::fingertip_distance_touching_thd_hi and
+				    index_tip_position.second > constants::gui::fingertip_distance_touching_thd_lo)
+					state.fingertip_touching = true;
+
+				if (palm_position.second < constants::gui::palm_distance_close_thd_lo)
+					current_aim_interaction = 0;
+				else if (palm_position.second > constants::gui::palm_distance_close_thd_hi)
+					current_aim_interaction = 1;
+				else
+					current_aim_interaction =
+					        (palm_position.second - constants::gui::palm_distance_close_thd_lo) /
+					        (constants::gui::palm_distance_close_thd_hi - constants::gui::palm_distance_close_thd_lo);
+			}
 		}
 
-		new_state.source = ImGuiMouseSource_VRController;
-
+		// Then controllers
 		if (auto location = application::locate_controller(ctrl.aim, world, display_time))
 		{
-			new_state.active = true;
-			new_state.aim_position = location->first + glm::mat3_cast(location->second * ctrl.offset.second) * ctrl.offset.first;
-			new_state.aim_orientation = location->second * ctrl.offset.second;
+			controller_position = compute_pointer_position(controller_state{
+			        .aim_position = location->first + glm::mat3_cast(location->second * ctrl.offset.second) * ctrl.offset.first,
+			        .aim_orientation = location->second * ctrl.offset.second,
+			        .source = ImGuiMouseSource_VRController,
+			});
 
-			if (ctrl.trigger)
+			if (current_aim_interaction == 1)
 			{
-				auto trigger = application::read_action_float(ctrl.trigger).value_or(std::pair{0, 0});
-				new_state.trigger_value = trigger.second;
+				if (ctrl.trigger)
+				{
+					auto trigger = application::read_action_float(ctrl.trigger).value_or(std::pair{0, 0});
+					state.trigger_value = trigger.second;
 
-				// TODO tunable
-				/*if (new_state.trigger_value < 0.5)
-				        new_state.trigger_clicked = false;
-				else */
-				if (new_state.trigger_value > constants::gui::trigger_click_thd)
-					new_state.trigger_clicked = true;
-			}
+					if (state.trigger_value > constants::gui::trigger_click_thd)
+						state.trigger_clicked = true;
+				}
 
-			if (ctrl.scroll)
-			{
-				if (auto act = application::read_action_vec2(ctrl.scroll); act)
-					new_state.scroll_value = {-act->second.x * scroll_scale, act->second.y * scroll_scale};
-				else
-					new_state.scroll_value = {0, 0};
+				if (ctrl.scroll)
+				{
+					if (auto act = application::read_action_vec2(ctrl.scroll); act)
+						state.scroll_value = {-act->second.x * scroll_scale, act->second.y * scroll_scale};
+					else
+						state.scroll_value = {0, 0};
+				}
 			}
 		}
-	}
 
-	// Compute the position in imgui frame according to the currently displayed windows (from the last frame)
-	for (auto & state: new_states)
-	{
-		compute_pointer_position(state);
-
-		if (state.source == ImGuiMouseSource_VRHandTracking)
+		if (current_aim_interaction == 0 or not controller_position.first)
+			state.pointer_position = index_tip_position.first;
+		else if (current_aim_interaction == 1 or not index_tip_position.first)
+			state.pointer_position = controller_position.first;
+		else
 		{
-			if (state.hover_distance < constants::gui::fingertip_distance_hovering_thd)
-				state.fingertip_hovering = true;
-
-			if (state.hover_distance < constants::gui::fingertip_distance_touching_thd)
-				state.fingertip_touching = true;
+			assert(index_tip_position.first);
+			assert(controller_position.first);
+			state.pointer_position = *index_tip_position.first + (*controller_position.first - *index_tip_position.first) * current_aim_interaction;
 		}
+
+		if (current_aim_interaction < 1)
+			state.source = ImGuiMouseSource_VRHandTracking;
+		else
+			state.source = ImGuiMouseSource_VRController;
 	}
 
 	return new_states;
 }
 
-void imgui_context::compute_pointer_position(imgui_context::controller_state & state)
+std::pair<std::optional<ImVec2>, float> imgui_context::compute_pointer_position(const imgui_context::controller_state & state) const
 {
 	auto intersections = ray_plane_intersection(state);
 
 	if (intersections.empty())
-	{
-		state.hover_distance = std::numeric_limits<float>::infinity();
-		state.pointer_position = std::nullopt;
-		return;
-	}
+		return {std::nullopt, std::numeric_limits<float>::max()};
 
 	if (ImGuiWindow * modal_popup = ImGui::GetTopMostAndVisiblePopupModal())
 	{
@@ -638,17 +696,12 @@ void imgui_context::compute_pointer_position(imgui_context::controller_state & s
 				for (auto [position, distance]: intersections)
 				{
 					if (in_viewport(i, position))
-					{
-						state.hover_distance = distance;
-						state.pointer_position = position;
-						return;
-					}
+						return {position, distance};
 				}
 			}
 		}
 
-		state.hover_distance = std::numeric_limits<float>::infinity();
-		state.pointer_position = std::nullopt;
+		return {std::nullopt, std::numeric_limits<float>::max()};
 	}
 	else
 	{
@@ -661,16 +714,12 @@ void imgui_context::compute_pointer_position(imgui_context::controller_state & s
 					continue;
 
 				if (in_window(window, position))
-				{
-					state.hover_distance = distance;
-					state.pointer_position = position;
-					return;
-				}
+					return {position, distance};
 			}
 		}
 
 		// If the pointer isn't in any window, take the farthest one
-		std::tie(state.pointer_position, state.hover_distance) = intersections.back();
+		return intersections.back();
 	}
 }
 
@@ -705,6 +754,13 @@ size_t imgui_context::choose_focused_controller(const std::vector<controller_sta
 		                 (new_state.source == ImGuiMouseSource_VRHandTracking and new_state.fingertip_touching);
 
 		if (not old_click and new_click)
+			return index;
+	}
+
+	// scrolling?
+	for (auto && [index, state]: utils::enumerate(new_states))
+	{
+		if (glm::length(state.scroll_value) > constants::gui::scroll_value_thd)
 			return index;
 	}
 
@@ -792,7 +848,7 @@ std::vector<std::pair<int, XrCompositionLayerQuad>> imgui_context::end_frame()
 			application::haptic_start(haptic_output, XR_NULL_PATH, 10'000'000, 1000, 1);
 	}
 
-	vk::Image destination = swapchain.images()[image_index].image;
+	vk::Image destination = swapchain.image(image_index);
 
 	ImGui::SetCurrentContext(context);
 	ImPlot::SetCurrentContext(plot_context);
@@ -856,7 +912,7 @@ std::vector<std::pair<int, XrCompositionLayerQuad>> imgui_context::end_frame()
 			}
 
 			// Compute the distance to the closest window
-			float distance = std::numeric_limits<float>::infinity();
+			float distance = std::numeric_limits<float>::max();
 			for (ImGuiWindow * window: context->Windows)
 			{
 				distance = std::min(distance, distance_to_window(window, *position));
@@ -864,21 +920,41 @@ std::vector<std::pair<int, XrCompositionLayerQuad>> imgui_context::end_frame()
 
 			float alpha = std::clamp<float>(1 - distance / constants::gui::pointer_fading_distance, 0, 1);
 
-			if (&controller == &controllers[focused_controller])
+			if (focused_controller != (size_t)-1 and &controller == &controllers[focused_controller])
 				alpha *= constants::gui::pointer_alpha;
 			else
 				alpha *= constants::gui::pointer_alpha_disabled;
 
-			ImU32 color_pressed = ImGui::GetColorU32(constants::gui::pointer_color_pressed, alpha);
-			ImU32 color_unpressed = ImGui::GetColorU32(constants::gui::pointer_color_unpressed, alpha);
-
-			bool pressed = controller.second.trigger_clicked || controller.second.fingertip_touching;
+			float radius_in = constants::gui::pointer_radius_in;
+			float radius_out = radius_in + constants::gui::pointer_thickness * 0.5;
 
 			ImDrawList * draw_list = ImGui::GetForegroundDrawList();
 			draw_list->PushClipRect(clip_rect_min, clip_rect_max);
-			draw_list->AddCircleFilled(*position, constants::gui::pointer_radius_in, pressed ? color_pressed : color_unpressed);
-			draw_list->AddCircle(*position, constants::gui::pointer_radius_out, ImGui::GetColorU32(constants::gui::pointer_color_border, alpha), 0, constants::gui::pointer_thickness);
+			draw_list->AddCircleFilled(*position, radius_in, ImGui::GetColorU32(constants::gui::pointer_color, alpha));
+			draw_list->AddCircle(*position, radius_out, ImGui::GetColorU32(constants::gui::pointer_color_border, alpha), 0, constants::gui::pointer_thickness);
 			draw_list->PopClipRect();
+		}
+	}
+
+	if (auto modal_popup = ImGui::GetTopMostAndVisiblePopupModal(); modal_popup != nullptr)
+	{
+		ImDrawList * draw_list = ImGui::GetForegroundDrawList();
+		for (ImGuiWindow * window: context->Windows)
+		{
+			if (window == modal_popup or window->ParentWindow != nullptr or not window->Active or window->Hidden or window->IsFallbackWindow)
+				continue;
+
+			static const auto virtual_keyboard_id = ImHashStr("VirtualKeyboard");
+			if (window->ID == virtual_keyboard_id)
+				continue;
+
+			ImRect window_rect{
+			        window->Pos.x,
+			        window->Pos.y,
+			        window->Pos.x + window->Size.x,
+			        window->Pos.y + window->Size.y};
+
+			draw_list->AddRectFilled(window_rect.Min, window_rect.Max, ImGui::ColorConvertFloat4ToU32(wivrn::ui::current().dimming), window->WindowRounding);
 		}
 	}
 
@@ -932,14 +1008,46 @@ std::vector<std::pair<int, XrCompositionLayerQuad>> imgui_context::end_frame()
 	for (auto & i: layers_)
 	{
 		bool visible = false;
+
+		ImRect layer_rect(
+		        i.vp_origin.x,
+		        i.vp_origin.y,
+		        i.vp_origin.x + i.vp_size.x,
+		        i.vp_origin.y + i.vp_size.y);
+
+		ImRect all_windows_rect{
+		        std::numeric_limits<float>::max(),
+		        std::numeric_limits<float>::max(),
+		        std::numeric_limits<float>::lowest(),
+		        std::numeric_limits<float>::lowest(),
+		};
+
 		for (ImGuiWindow * window: context->Windows)
 		{
-			if (window->Active and not window->Hidden and window_intersects_viewport(window, i))
+			ImRect window_rect{
+			        window->Pos.x,
+			        window->Pos.y,
+			        window->Pos.x + window->Size.x,
+			        window->Pos.y + window->Size.y};
+
+			if (window->Active and not window->Hidden and layer_rect.Overlaps(window_rect))
 			{
 				visible = true;
-				break;
+
+				// Take the union of all visible windows in this layer
+				all_windows_rect.Add(window_rect);
 			}
 		}
+
+		// Take the intersection with the layer
+		all_windows_rect.ClipWithFull(layer_rect);
+
+		glm::vec2 pixel_size = i.size / glm::vec2(i.vp_size);
+		glm::vec2 all_windows_center(all_windows_rect.GetCenter().x, all_windows_rect.GetCenter().y);
+		glm::vec2 layer_center(layer_rect.GetCenter().x, layer_rect.GetCenter().y);
+
+		glm::vec3 new_position = i.position + i.orientation * glm::vec3((all_windows_center - layer_center) * pixel_size, 0);
+		glm::vec2 new_size = glm::vec2(all_windows_rect.GetWidth(), all_windows_rect.GetHeight()) * pixel_size;
 
 		if (not visible)
 			continue;
@@ -955,12 +1063,12 @@ std::vector<std::pair<int, XrCompositionLayerQuad>> imgui_context::end_frame()
 		                        .swapchain = swapchain,
 		                        .imageRect = {
 		                                .offset = {
-		                                        .x = i.vp_origin.x,
-		                                        .y = i.vp_origin.y,
+		                                        .x = int(all_windows_rect.Min.x),
+		                                        .y = int(all_windows_rect.Min.y),
 		                                },
 		                                .extent = {
-		                                        .width = i.vp_size.x,
-		                                        .height = i.vp_size.y,
+		                                        .width = int(all_windows_rect.Max.x - all_windows_rect.Min.x),
+		                                        .height = int(all_windows_rect.Max.y - all_windows_rect.Min.y),
 		                                }},
 		                },
 		                .pose = {
@@ -971,19 +1079,63 @@ std::vector<std::pair<int, XrCompositionLayerQuad>> imgui_context::end_frame()
 		                                .w = i.orientation.w,
 		                        },
 		                        .position = {
-		                                .x = i.position.x,
-		                                .y = i.position.y,
-		                                .z = i.position.z,
+		                                .x = new_position.x,
+		                                .y = new_position.y,
+		                                .z = new_position.z,
 		                        },
 		                },
 		                .size = {
-		                        .width = i.size.x,
-		                        .height = i.size.y,
+		                        .width = new_size.x,
+		                        .height = new_size.y,
 		                },
 		        });
 	}
 
 	return quads;
+}
+
+std::vector<imgui_context::window_viewport> imgui_context::windows()
+{
+	std::vector<imgui_context::window_viewport> w;
+
+	for (const imgui_context::viewport & layer: layers_)
+	{
+		if (layer.space != xr::spaces::world)
+			continue;
+
+		ImRect v(layer.vp_origin.x, layer.vp_origin.y, layer.vp_origin.x + layer.vp_size.x, layer.vp_origin.y + layer.vp_size.y);
+
+		for (ImGuiWindow * window: context->Windows)
+		{
+			if (not window->Active or window->Hidden or (window->Flags & ImGuiWindowFlags_ChildWindow))
+				continue;
+
+			if (not window_intersects_viewport(window, layer))
+				continue;
+
+			// The window intersects the viewport: compute the window position in the real world
+			ImVec2 max = ImMin(v.Max, window->Pos + window->Size);
+			ImVec2 min = ImMax(v.Min, window->Pos);
+			ImVec2 center = (min + max) / 2;
+
+			w.push_back(window_viewport{
+			        .space = layer.space,
+			        .position = layer.position +
+			                    glm::mat3_cast(layer.orientation) *
+			                            glm::vec3(
+			                                    ((center.x - layer.vp_origin.x) / layer.vp_size.x - 0.5) * layer.size.x,
+			                                    (-(center.y - layer.vp_origin.y) / layer.vp_size.y + 0.5) * layer.size.y,
+			                                    0),
+			        .orientation = layer.orientation,
+			        .size = {
+			                (max.x - min.x) * layer.size.x / layer.vp_size.x,
+			                (max.y - min.y) * layer.size.y / layer.vp_size.y,
+			        },
+			});
+		}
+	}
+
+	return w;
 }
 
 void imgui_context::vibrate_on_hover()
@@ -1020,29 +1172,32 @@ imgui_context::~imgui_context()
 	ImGui::DestroyContext(context);
 }
 
-ImTextureID imgui_context::load_texture(const std::string & filename, vk::raii::Sampler && sampler)
+ImTextureID imgui_textures::load_texture(const std::string & filename)
 {
-	return load_texture(std::span<const std::byte>{asset{filename}}, std::move(sampler));
+	return load_texture(utils::mapped_file{filename}, filename);
 }
 
-ImTextureID imgui_context::load_texture(const std::span<const std::byte> & bytes, vk::raii::Sampler && sampler)
+ImTextureID imgui_textures::load_texture(const std::span<const std::byte> & bytes, const std::string & name)
 {
 	bool srgb = true;
-	image_loader loader(physical_device, device, queue, command_pool);
-	loader.load(bytes, srgb);
+
+	std::shared_ptr<loaded_image> image;
+	if (name == "")
+		image = image_cache->load_uncached(bytes, srgb, "", true /* premultiply alpha */);
+	else
+		image = image_cache->load(name, bytes, srgb, name, true /* premultiply alpha */);
 
 	std::shared_ptr<vk::raii::DescriptorSet> ds = descriptor_pool.allocate();
 
 	vk::DescriptorImageInfo image_info{
-	        .sampler = *sampler,
-	        .imageView = **loader.image_view,
+	        .imageView = *image->image_view,
 	        .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
 	};
 
 	vk::WriteDescriptorSet ds_write{
 	        .dstSet = **ds,
 	        .descriptorCount = 1,
-	        .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+	        .descriptorType = vk::DescriptorType::eSampledImage,
 	        .pImageInfo = &image_info};
 
 	device.updateDescriptorSets(ds_write, nullptr);
@@ -1052,60 +1207,15 @@ ImTextureID imgui_context::load_texture(const std::span<const std::byte> & bytes
 	textures.emplace(
 	        id,
 	        texture_data{
-	                .sampler = std::move(sampler),
-	                // .image = std::move(loader.image),
-	                .image_view = std::move(loader.image_view),
+	                .image = image,
 	                .descriptor_set = std::move(ds),
 	        });
 
 	return id;
 }
 
-ImTextureID imgui_context::load_texture(const std::span<const std::byte> & bytes)
+void imgui_textures::free_texture(ImTextureID texture)
 {
-	return load_texture(
-	        bytes,
-	        vk::raii::Sampler{
-	                device,
-	                vk::SamplerCreateInfo{
-	                        .magFilter = vk::Filter::eLinear,
-	                        .minFilter = vk::Filter::eLinear,
-	                        .mipmapMode = vk::SamplerMipmapMode::eLinear,
-	                        .addressModeU = vk::SamplerAddressMode::eClampToEdge,
-	                        .addressModeV = vk::SamplerAddressMode::eClampToEdge,
-	                        .addressModeW = vk::SamplerAddressMode::eClampToEdge,
-	                        .borderColor = vk::BorderColor::eFloatTransparentBlack,
-	                },
-	        });
-}
-
-ImTextureID imgui_context::load_texture(const std::string & filename)
-{
-	return load_texture(
-	        filename,
-	        vk::raii::Sampler{
-	                device,
-	                vk::SamplerCreateInfo{
-	                        .magFilter = vk::Filter::eLinear,
-	                        .minFilter = vk::Filter::eLinear,
-	                        .mipmapMode = vk::SamplerMipmapMode::eLinear,
-	                        .addressModeU = vk::SamplerAddressMode::eClampToEdge,
-	                        .addressModeV = vk::SamplerAddressMode::eClampToEdge,
-	                        .addressModeW = vk::SamplerAddressMode::eClampToEdge,
-	                        .borderColor = vk::BorderColor::eFloatTransparentBlack,
-	                },
-	        });
-}
-
-void imgui_context::free_texture(ImTextureID texture)
-{
-	// Make sure we are done using the texture
-	std::vector<vk::Fence> fences;
-	for (auto & f: command_buffers)
-		fences.push_back(*f.fence);
-	if (auto result = device.waitForFences(fences, true, 1'000'000'000); result != vk::Result::eSuccess)
-		spdlog::error("vkWaitForfences: {}", vk::to_string(result));
-
 	textures.erase(texture);
 }
 
@@ -1120,11 +1230,6 @@ void imgui_context::set_controllers_enabled(bool value)
 	controllers_enabled = value;
 }
 
-bool imgui_context::is_modal_popup_shown() const
-{
-	return ImGui::GetTopMostAndVisiblePopupModal() != nullptr;
-}
-
 imgui_context::viewport & imgui_context::layer(ImVec2 position)
 {
 	for (auto & layer: layers_)
@@ -1136,49 +1241,161 @@ imgui_context::viewport & imgui_context::layer(ImVec2 position)
 	return layers_.front();
 }
 
-void imgui_context::tooltip(std::string_view text)
+void imgui_context::place_layer_relative(size_t layer, size_t base, glm::vec3 offset, glm::quat extra_rotation)
+{
+	const viewport & b = layers_[base];
+	viewport & l = layers_[layer];
+	l.orientation = b.orientation * extra_rotation;
+	l.position = b.position + glm::mat3_cast(b.orientation) * offset;
+}
+
+void imgui_context::tooltip(std::string_view text, std::optional<ImVec2> anchor)
 {
 	// FIXME: this is incorrect if we use the docking branch of imgui
 	ImGuiViewport * viewport = ImGui::GetMainViewport();
-	auto & current_layer = layer(ImGui::GetMousePos());
+	auto & current_layer = layer(anchor.value_or(ImGui::GetMousePos()));
+
+	assert(std::ranges::contains(layers_, true, &viewport::tooltip_viewport));
+	auto & tooltip_layer = *std::ranges::find(layers_, true, &viewport::tooltip_viewport);
+
+	// anchor above the given display point, or above the last item's rect (top center)
+	ImVec2 item_position = anchor.value_or(ImVec2{
+	        (ImGui::GetItemRectMin().x + ImGui::GetItemRectMax().x) / 2,
+	        ImGui::GetItemRectMin().y,
+	});
+
 	auto pos_backup = viewport->Pos;
 	auto size_backup = viewport->Size;
-	viewport->Pos = ImVec2(current_layer.vp_origin.x, current_layer.vp_origin.y);
-	viewport->Size = ImVec2(current_layer.vp_size.x, current_layer.vp_size.y);
+	viewport->Pos = ImVec2(tooltip_layer.vp_origin.x, tooltip_layer.vp_origin.y);
+	viewport->Size = ImVec2(tooltip_layer.vp_size.x, tooltip_layer.vp_size.y);
 
-	ImVec2 pos{
-	        (ImGui::GetItemRectMin().x + ImGui::GetItemRectMax().x) / 2,
-	        ImGui::GetItemRectMin().y - constants::style::tooltip_distance,
-	};
-
-	ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, constants::style::tooltip_padding);
-	ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, constants::style::tooltip_rounding);
-
+	// Draw the tooltip in the tooltip layer, themed
 	// Clamp position to avoid overflowing on the left or the right
+	const wivrn::ui::theme & t = wivrn::ui::current();
+	ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, wivrn::ui::metrics::tooltip_padding);
+	ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, t.card_rounding);
+	ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, t.border_size);
+	ImGui::PushStyleColor(ImGuiCol_PopupBg, t.card);
+	ImGui::PushStyleColor(ImGuiCol_Border, t.border);
+
 	auto & style = ImGui::GetStyle();
 	const ImVec2 text_size = ImGui::CalcTextSize(text.data(), text.data() + text.size(), true);
-	const ImVec2 size = {text_size.x + style.WindowPadding.x * 2.0f, text_size.y + style.WindowPadding.y * 2.0f};
-	pos.x = std::clamp<float>(pos.x, viewport->Pos.x + size.x / 2, viewport->Pos.x + viewport->Size.x - size.x / 2);
-	ImVec2 pivot = {0.5, 1};
+	const ImVec2 tooltip_size = {text_size.x + style.WindowPadding.x * 2.0f, text_size.y + style.WindowPadding.y * 2.0f};
 
-	// Move tooltip below the item if it overflows on the top
-	if (pos.y - size.y <= viewport->Pos.y)
-	{
-		pos.y = ImGui::GetItemRectMax().y + constants::style::tooltip_distance;
-		pivot.y = 0;
-	}
-
-	ImGui::SetNextWindowPos(pos, ImGuiCond_Always, pivot);
+	ImGui::SetNextWindowPos(viewport->Pos + viewport->Size * 0.5, ImGuiCond_Always, {0.5, 0.5});
+	ImGui::SetNextWindowSizeConstraints({0, 0}, viewport->Size);
 	if (ImGui::BeginTooltip())
 	{
-		ImGui::PushStyleColor(ImGuiCol_Text, 0xffffffff);
+		ImGui::PushStyleColor(ImGuiCol_Text, t.col(t.text));
 		ImGui::TextUnformatted(text.data(), text.data() + text.size());
 		ImGui::PopStyleColor();
 		ImGui::EndTooltip();
 	}
-
-	ImGui::PopStyleVar(2);
+	ImGui::PopStyleColor(2);
+	ImGui::PopStyleVar(3);
 
 	viewport->Pos = pos_backup;
 	viewport->Size = size_backup;
+
+	// Compute the tooltip position
+	glm::quat tooltip_orientation = current_layer.orientation;
+	auto M = glm::mat3_cast(tooltip_orientation);
+
+	float pixel_size = current_layer.size.y / current_layer.vp_size.y;
+	glm::vec3 tooltip_position_centre = rw_from_vp(item_position) + M * (glm::vec3(0, tooltip_size.y / 2, 0) * pixel_size + constants::gui::tooltip_distance);
+
+	// Position the tooltip layer
+	tooltip_layer.position = tooltip_position_centre;
+	tooltip_layer.orientation = tooltip_orientation;
+}
+
+// https://github.com/ocornut/imgui/issues/3379#issuecomment-2943903877
+void ScrollWhenDragging()
+{
+	ImVec2 delta{0.0f, -ImGui::GetIO().MouseDelta.y};
+	const ImGuiMouseButton mouse_button = ImGuiMouseButton_Left;
+
+	ImGuiContext & g = *ImGui::GetCurrentContext();
+	ImGuiWindow * window = g.CurrentWindow;
+	ImGuiID id = window->GetID("##scrolldraggingoverlay");
+	ImGui::KeepAliveID(id);
+
+	static int active_id;
+	static ImVec2 cumulated_delta;
+
+	// don't drag while a popup is open or just closed: the ray snaps back and synthesises a click
+	static bool popup_was_open;
+	const bool popup_open = ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel);
+
+	bool HoveredIdAllowOverlap_backup = std::exchange(g.HoveredIdAllowOverlap, true);
+	bool ActiveIdAllowOverlap_backup = std::exchange(g.ActiveIdAllowOverlap, true);
+	// start only over this window or a child card, and only with no active widget
+	const bool over = ImGui::IsWindowHovered(ImGuiHoveredFlags_ChildWindows);
+	if (active_id == 0 and g.ActiveId == 0 and not popup_open and not popup_was_open and over and ImGui::IsMouseClicked(mouse_button, ImGuiInputFlags_None, /*id*/ ImGuiKeyOwner_Any))
+	{
+		active_id = id;
+
+		// Don't scroll on the first step, in case the active controller just changed
+		delta = {};
+		cumulated_delta = {};
+	}
+
+	if (not g.IO.MouseDown[mouse_button])
+		active_id = 0;
+
+	if (active_id == id)
+	{
+		if (delta.x != 0.0f)
+			ImGui::SetScrollX(window, window->Scroll.x + delta.x);
+		if (delta.y != 0.0f)
+			ImGui::SetScrollY(window, window->Scroll.y + delta.y);
+
+		cumulated_delta += delta;
+		if (std::max(std::abs(cumulated_delta.x), std::abs(cumulated_delta.y)) > 50)
+			ImGui::ClearActiveID();
+	}
+
+	g.HoveredIdAllowOverlap = HoveredIdAllowOverlap_backup;
+	g.ActiveIdAllowOverlap = ActiveIdAllowOverlap_backup;
+
+	popup_was_open = popup_open;
+}
+
+void CenterTextH(const std::string & text)
+{
+	float win_width = ImGui::GetWindowSize().x;
+
+	std::vector<std::string> lines = utils::split(text);
+
+	ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, {0, 0});
+	for (const auto & i: lines)
+	{
+		float text_width = ImGui::CalcTextSize(i.c_str()).x;
+		ImGui::SetCursorPosX((win_width - text_width) / 2);
+		ImGui::Text("%s", i.c_str());
+	}
+	ImGui::PopStyleVar();
+	ImGui::Dummy({}); // Make sure the original vertical ItemSpacing is respected
+}
+
+void CenterTextHV(const std::string & text)
+{
+	ImVec2 size = ImGui::GetWindowSize();
+
+	std::vector<std::string> lines = utils::split(text);
+
+	float text_height = 0;
+	for (const auto & i: lines)
+		text_height += ImGui::CalcTextSize(i.c_str()).y;
+
+	ImGui::SetCursorPosY((size.y - text_height) / 2);
+
+	ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, {0, 0});
+	for (const auto & i: lines)
+	{
+		float text_width = ImGui::CalcTextSize(i.c_str()).x;
+		ImGui::SetCursorPosX((size.x - text_width) / 2);
+		ImGui::Text("%s", i.c_str());
+	}
+	ImGui::PopStyleVar();
 }

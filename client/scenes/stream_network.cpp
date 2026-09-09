@@ -19,13 +19,10 @@
 
 #include "stream.h"
 
-#ifdef __ANDROID__
 #include "application.h"
-#endif
-
+#include "utils/i18n.h"
 #include "utils/named_thread.h"
 
-#include <algorithm>
 #include <spdlog/spdlog.h>
 #include <uni_algo/case.h>
 
@@ -34,7 +31,7 @@ void scenes::stream::process_packets()
 #ifdef __ANDROID__
 	application::instance().setup_jni();
 #endif
-	while (not exiting)
+	while (state_ != state::shutdown)
 	{
 		try
 		{
@@ -44,6 +41,28 @@ void scenes::stream::process_packets()
 		{
 			spdlog::info("Exception in network thread, exiting: {}", e.what());
 			exit();
+		}
+	}
+}
+
+void scenes::stream::operator()(to_headset::server_message && message)
+{
+	switch (message.kind)
+	{
+		case to_headset::server_message::kind::toast:
+		case to_headset::server_message::kind::toast_urgent: {
+			auto toast = gui_toast.lock();
+			toast->emplace(message.msg, message.kind == to_headset::server_message::kind::toast_urgent);
+
+			gui_status_last_change = instance.now();
+			break;
+		}
+
+		case to_headset::server_message::kind::error: {
+			auto queue = stream_error_queue.lock();
+			queue->emplace(std::move(message.msg));
+
+			break;
 		}
 	}
 }
@@ -58,6 +77,26 @@ void scenes::stream::operator()(to_headset::video_stream_data_shard && shard)
 		return;
 	}
 	decoders[idx].decoder->push_shard(std::move(shard));
+}
+
+void scenes::stream::operator()(to_headset::feature_control && control)
+{
+	switch (control.f)
+	{
+		case wivrn::to_headset::feature_control::hid_input:
+			hid_forwarding = control.state;
+			if (not control.state and (application::get_config().forward_keyboard or application::get_config().forward_mouse or application::get_config().forward_gamepad))
+			{
+				auto toast = gui_toast.lock();
+				toast->emplace(_("The server does not allow forwarded input devices"), true);
+				gui_status_last_change = instance.now();
+			}
+			return;
+		case wivrn::to_headset::feature_control::microphone:
+			if (audio_handle)
+				audio_handle->set_mic_state(control.state);
+			return;
+	}
 }
 
 void scenes::stream::operator()(to_headset::audio_stream_description && desc)
@@ -77,7 +116,16 @@ void scenes::stream::operator()(to_headset::video_stream_description && desc)
 
 void scenes::stream::operator()(to_headset::refresh_rate_change && rate)
 {
-	session.set_refresh_rate(rate.fps);
+	spdlog::info("refresh rate change request: {}", rate.hz);
+	session.set_refresh_rate(rate.hz);
+	std::shared_lock lock(decoder_mutex);
+	if (video_stream_description)
+		video_stream_description->refresh_rate = rate.hz;
+}
+
+void scenes::stream::operator()(to_headset::stream_tab_change && tab)
+{
+	next_gui_status = tab.tab;
 }
 
 void scenes::stream::operator()(to_headset::timesync_query && query)
@@ -106,31 +154,19 @@ void scenes::stream::send_feedback(const wivrn::from_headset::feedback & feedbac
 	}
 }
 
-void scenes::stream::operator()(to_headset::application_list && apps)
+void scenes::stream::operator()(to_headset::application_list && l)
 {
-	std::ranges::sort(apps.applications, [](auto & l, auto & r) {
-		return una::casesens::collate_utf8(l.name, r.name) < 0;
-	});
-
-	auto locked = applications.lock();
-
-	locked->clear();
-	locked->reserve(apps.applications.size());
-	for (const auto & i: apps.applications)
-	{
-		locked->push_back(app{
-		        .id = std::move(i.id),
-		        .name = std::move(i.name),
-		});
-	}
+	apps(std::move(l));
 }
 
 void scenes::stream::operator()(to_headset::application_icon && icon)
 {
-	auto locked = applications.lock();
+	apps(std::move(icon));
+}
 
-	if (auto it = std::ranges::find(*locked, icon.id, &app::id); it != locked->end())
-		it->image = std::move(icon.image);
+void scenes::stream::operator()(to_headset::running_applications && apps)
+{
+	*running_applications.lock() = std::move(apps);
 }
 
 void scenes::stream::start_application(std::string appid)

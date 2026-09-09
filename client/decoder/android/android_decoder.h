@@ -67,14 +67,12 @@ public:
 
 private:
 	uint8_t stream_index;
-	float fps;
 
 	vk::raii::Device & device;
 
 	vk::AndroidHardwareBufferFormatPropertiesANDROID ahb_format;
 	vk::raii::SamplerYcbcrConversion ycbcr_conversion = nullptr;
 	vk::raii::Sampler ycbcr_sampler = nullptr;
-	vk::Extent2D extent{};
 
 	std::mutex hbm_mutex;
 	std::shared_ptr<AImageReader> image_reader;
@@ -123,8 +121,7 @@ private:
 public:
 	decoder(vk::raii::Device & device,
 	        vk::raii::PhysicalDevice & physical_device,
-	        const wivrn::to_headset::video_stream_description::item & description,
-	        float fps,
+	        const wivrn::to_headset::video_stream_description & description,
 	        uint8_t stream_index,
 	        std::weak_ptr<scenes::stream> scene,
 	        shard_accumulator * accumulator);

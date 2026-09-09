@@ -20,10 +20,12 @@
 #pragma once
 
 #ifdef __ANDROID__
+#include "android/hid.h"
 #include <android_native_app_glue.h>
 #endif
 
 #include "configuration.h"
+#include "hmd_traits.h"
 #include "utils/singleton.h"
 #include "utils/thread_safe.h"
 #include "vk/vk_allocator.h"
@@ -53,7 +55,7 @@
 class scene;
 
 #ifdef __ANDROID__
-extern "C" __attribute__((visibility("default"))) void Java_org_meumeu_wivrn_MainActivity_onNewIntent(JNIEnv * env, jobject instance, jobject intent_obj);
+extern "C" void Java_org_meumeu_wivrn_MainActivity_onNewIntent(JNIEnv * env, jobject instance, jobject intent_obj);
 #endif
 
 struct application_info
@@ -73,14 +75,17 @@ class application : public singleton<application>
 {
 	friend class scene;
 
+private:
 #ifdef __ANDROID__
-	friend __attribute__((visibility("default"))) void Java_org_meumeu_wivrn_MainActivity_onNewIntent(JNIEnv * env, jobject instance, jobject intent_obj);
+	friend void Java_org_meumeu_wivrn_MainActivity_onNewIntent(JNIEnv * env, jobject instance, jobject intent_obj);
 #endif
 
 	application_info app_info;
 #ifdef __ANDROID__
 	ANativeWindow * native_window = nullptr;
 	bool resumed = false;
+
+	android_hid::input_handler input_handler{};
 #endif
 
 	static inline const char engine_name[] = "No engine";
@@ -132,6 +137,8 @@ class application : public singleton<application>
 	bool session_running = false;
 	bool session_focused = false;
 	bool session_visible = false;
+	std::optional<std::chrono::steady_clock::time_point> timestamp_unsynchronized; // Timestamp when session_synchronized becomes false
+
 	bool debug_extensions_found = false;
 	std::vector<const char *> vk_device_extensions;
 	std::atomic<bool> exit_requested = false;
@@ -149,9 +156,11 @@ class application : public singleton<application>
 	std::chrono::nanoseconds last_scene_cpu_time;
 
 	std::optional<configuration> config;
+	std::optional<configuration> default_config;
 
 	boost::locale::generator gen;
 	boost::locale::gnu_gettext::messages_info messages_info;
+	hmd_traits runtime_hmd_traits;
 
 private:
 	void loop();
@@ -198,6 +207,11 @@ public:
 	{
 		return instance().app_info.native_app;
 	}
+
+	static android_hid::input_handler & get_input_handler()
+	{
+		return instance().input_handler;
+	}
 #endif
 
 	static bool is_session_running()
@@ -231,7 +245,7 @@ public:
 	{
 		return instance().actions;
 	}
-	static std::pair<XrAction, XrActionType> get_action(const std::string & name);
+	static std::pair<XrAction, XrActionType> get_action(std::string_view name);
 
 	static std::optional<std::pair<glm::vec3, glm::quat>> locate_controller(XrSpace space, XrSpace reference, XrTime time)
 	{
@@ -298,6 +312,10 @@ public:
 		return *instance().wifi;
 	}
 
+#ifdef __ANDROID__
+	void set_usb_networking(bool enabled);
+#endif
+
 	static void ignore_debug_reports_for(void * object)
 	{
 #ifndef NDEBUG
@@ -317,8 +335,9 @@ public:
 	template <typename T>
 	static void set_debug_reports_name(const T & object, std::string name)
 	{
-		// #ifndef NDEBUG
-		// if (instance().debug_utils_found)
+		if (not vk_allocator::instance().has_debug_utils)
+			return;
+
 		const vk::DebugUtilsObjectNameInfoEXT name_info{
 		        .objectType = T::objectType,
 		        .objectHandle = (uint64_t)(typename T::NativeType)object,
@@ -326,10 +345,6 @@ public:
 		};
 
 		instance().vk_device.setDebugUtilsObjectNameEXT(name_info);
-
-		// printf("set_debug_reports_name %p, %s\n", object, name.c_str());
-		// instance().debug_report_object_name[(uint64_t)object] = std::move(name);
-		// #endif
 	}
 
 	static thread_safe<vk::raii::Queue> & get_queue()
@@ -355,6 +370,11 @@ public:
 	static vk::raii::Instance & get_vulkan_instance()
 	{
 		return instance().vk_instance;
+	}
+
+	static vk::raii::PhysicalDevice & get_physical_device()
+	{
+		return instance().vk_physical_device;
 	}
 
 	static xr::system & get_system()
@@ -392,6 +412,12 @@ public:
 		return instance().openxr_post_processing_supported;
 	}
 
+	static const hmd_traits & get_hmd_traits()
+	{
+		assert(instance().runtime_hmd_traits.is_initialized());
+		return instance().runtime_hmd_traits;
+	}
+
 	static auto & get_generic_trackers()
 	{
 		return instance().generic_trackers;
@@ -408,6 +434,12 @@ public:
 		return *instance().config;
 	}
 
+	static configuration & get_default_config()
+	{
+		assert(instance().default_config);
+		return *instance().default_config;
+	}
+
 	static XrSessionState get_session_state()
 	{
 		return instance().session_state;
@@ -417,4 +449,6 @@ public:
 	{
 		return instance().messages_info;
 	}
+
+	void load_locale();
 };

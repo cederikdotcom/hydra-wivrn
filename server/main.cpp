@@ -1,3 +1,23 @@
+/*
+ * WiVRn VR streaming
+ * Copyright (C) 2022-2026 Guillaume Meunier <guillaume.meunier@centraliens.net>
+ * Copyright (C) 2022-2026  Patrick Nicolas <patricknicolas@laposte.net>
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+// Original copyright, from very old copy-pasted parts
 // Copyright 2022, Collabora, Ltd.
 // SPDX-License-Identifier: BSL-1.0
 /*!
@@ -15,9 +35,10 @@
 #include "driver/configuration.h"
 #include "driver/wivrn_connection.h"
 #include "exit_codes.h"
-#include "hostname.h"
+#include "ipc_server_cb.h"
 #include "protocol_version.h"
 #include "start_application.h"
+#include "start_systemd_unit.h"
 #include "utils/overloaded.h"
 #include "version.h"
 #include "wivrn_config.h"
@@ -34,6 +55,7 @@
 #include <filesystem>
 #include <iostream>
 #include <libnotify/notification.h>
+#include <magic_enum.hpp>
 #include <memory>
 #include <poll.h>
 #include <random>
@@ -48,13 +70,8 @@
 #include <glib.h>
 #include <libnotify/notify.h>
 
-#include <server/ipc_server_interface.h>
 #include <shared/ipc_protocol.h>
 #include <util/u_file.h>
-
-#if WIVRN_USE_SYSTEMD
-#include "start_systemd_unit.h"
-#endif
 
 // Insert the on load constructor to init trace marker.
 U_TRACE_TARGET_SETUP(U_TRACE_WHICH_SERVICE)
@@ -133,11 +150,18 @@ static bool pressure_vessel_openxr_support()
 	return pv_var and pv_var == std::string_view("1");
 }
 
-static void append_delim(std::string & to, std::string_view what, char delim)
+// search for the directory in path named needle
+// with d = /a/b/c/d/e and needle = c
+// return /a/b/c
+// if it can't be found, return the full path
+static std::filesystem::path find_dir(const std::filesystem::path & d, const std::filesystem::path & needle)
 {
-	if (not to.empty())
-		to += delim;
-	to += what;
+	for (auto copy = d; copy != copy.parent_path(); copy = copy.parent_path())
+	{
+		if (copy.filename() == needle)
+			return copy;
+	}
+	return d;
 }
 
 static std::string steam_command()
@@ -145,31 +169,33 @@ static std::string steam_command()
 	std::string command;
 
 	if (not pressure_vessel_openxr_support())
-		command = "PRESSURE_VESSEL_IMPORT_OPENXR_1_RUNTIMES=1";
+		command = "PRESSURE_VESSEL_IMPORT_OPENXR_1_RUNTIMES=1 ";
+
+	std::string_view home{"\0", 1};
+	if (auto h = std::getenv("HOME"))
+		home = h;
 
 	if (auto p = active_runtime::openvr_compat_path().string(); not p.empty())
 	{
 		// /usr cannot be shared in pressure vessel container
 		if (p.starts_with("/usr"))
-			append_delim(command, " VR_OVERRIDE=/run/host" + p, ' ');
-		else if (p.starts_with("/var"))
-			append_delim(command, "PRESSURE_VESSEL_FILESYSTEMS_RW=" + p, ' ');
+			command += "VR_OVERRIDE=/run/host" + p + ' ';
+		else if (p.starts_with("/var") and not p.starts_with(home))
+			command += "PRESSURE_VESSEL_FILESYSTEMS_RW=" + find_dir(p, "io.github.wivrn.wivrn").string() + ' ';
 	}
 
 	if (not command.empty())
-		command += " %command%";
+		command += "%command%";
 
 	return command;
 }
 
 namespace
 {
-int stdin_pipe_fds[2];
 int control_pipe_fds[2];
 
 GMainLoop * main_loop;
 const AvahiPoll * poll_api;
-bool use_systemd;
 
 guint server_watch;
 guint server_kill_watch;
@@ -181,6 +207,9 @@ std::unique_ptr<children_manager> children;
 bool quitting_main_loop;
 bool do_fork;
 bool do_active_runtime;
+#if WIVRN_FEATURE_DEBUG_GUI
+bool show_debug_gui;
+#endif
 wivrn::service_publication publication;
 
 guint listener_watch;
@@ -225,35 +254,33 @@ void start_server(configuration config)
 	else if (server_pid == 0)
 	{
 		if (do_fork)
-		{
-			// Redirect stdin
-			dup2(stdin_pipe_fds[0], 0);
-			close(stdin_pipe_fds[0]);
-			close(stdin_pipe_fds[1]);
-		}
-
-		// foveation code does not allow oversampling
-		setenv("XRT_COMPOSITOR_SCALE_PERCENTAGE", "100", true);
-
-		// FIXME: synchronization fails on gfx pipeline
-		setenv("XRT_COMPOSITOR_COMPUTE", "1", true);
+			setsid();
 
 		setenv("AMD_DEBUG", "lowlatencyenc", false);
+
+		// https://github.com/WiVRn/WiVRn/issues/695
+		// something is broken with Intel CCS under vaapi
+		setenv("INTEL_DEBUG", "noccs", false);
+
+		setenv("XRT_LOG", "info", false);
+
+		wivrn::ipc_server_cb server_cb;
 
 		ipc_server_main_info server_info{
 		        .udgci = {
 		                .window_title = "WiVRn",
 #if WIVRN_FEATURE_DEBUG_GUI
-		                .open = config.debug_gui ? U_DEBUG_GUI_OPEN_ALWAYS : U_DEBUG_GUI_OPEN_AUTO,
+		                .open = (config.debug_gui or show_debug_gui) ? U_DEBUG_GUI_OPEN_ALWAYS : U_DEBUG_GUI_OPEN_AUTO,
 #else
 		                .open = U_DEBUG_GUI_OPEN_NEVER,
 #endif
 		        },
+		        .no_stdin = true,
 		};
 
 		try
 		{
-			exit(ipc_server_main(0, 0, &server_info /*argc, argv, ismi*/));
+			exit(ipc_server_main_common(&server_info, &server_cb, nullptr));
 		}
 		catch (std::exception & e)
 		{
@@ -269,7 +296,9 @@ void start_server(configuration config)
 
 		assert(server_watch == 0);
 		assert(server_kill_watch == 0);
+		wivrn_server_set_session_running(dbus_server, true);
 		server_watch = g_child_watch_add(server_pid, [](pid_t, int status, void *) {
+			wivrn_server_set_session_running(dbus_server, false);
 			display_child_status(status, "Server");
 			g_source_remove(server_watch);
 			if (server_kill_watch)
@@ -287,13 +316,10 @@ void start_server(configuration config)
 
 void kill_server()
 {
-	// Write to the server's stdin to make it quit
-	char buffer[] = "\n";
-	if (write(stdin_pipe_fds[1], &buffer, strlen(buffer)) < 0)
-		std::cerr << "Cannot stop monado properly." << std::endl;
+	wivrn_ipc_socket_main_loop->send(to_monado::stop{});
 
 	// Send SIGTERM after 1s if it is still running
-	server_kill_watch = g_timeout_add(1000, [](void *) {
+	server_kill_watch = g_timeout_add(3500, [](void *) {
 		assert(server_pid > 0);
 		kill(-server_pid, SIGTERM);
 		return G_SOURCE_REMOVE; }, 0);
@@ -306,7 +332,7 @@ void start_listening()
 
 	assert(listener_watch == 0);
 
-	listener = std::make_unique<TCPListener>(wivrn::default_port);
+	listener = std::make_unique<TCPListener>(configuration().port);
 	auto source_listener = g_unix_fd_source_new(listener->get_fd(), GIOCondition::G_IO_IN);
 	g_source_set_callback(source_listener, G_SOURCE_FUNC(&headset_connected), nullptr, nullptr);
 	listener_watch = g_source_attach(source_listener, nullptr);
@@ -340,10 +366,11 @@ void start_publishing()
 			sprintf(protocol_string, "%016" PRIx64, wivrn::protocol_version);
 			std::map<std::string, std::string> TXT = {
 			        {"protocol", protocol_string},
-			        {"version", wivrn::git_version},
+			        {"version", wivrn::display_version()},
 			        {"cookie", server_cookie()},
 			};
-			publisher.emplace(poll_api, hostname(), "_wivrn._tcp", wivrn::default_port, TXT);
+			auto configuration = wivrn::configuration();
+			publisher.emplace(poll_api, configuration.hostname, "_wivrn._tcp", configuration.port, TXT);
 		}
 	}
 }
@@ -410,8 +437,6 @@ gboolean headset_connected_success(void *)
 
 	if (enc_state == wivrn_connection::encryption_state::pairing)
 		set_encryption_state(wivrn_connection::encryption_state::enabled);
-
-	init_cleanup_functions();
 
 	std::cerr << "Client connected" << std::endl;
 
@@ -497,14 +522,27 @@ gboolean control_received(gint fd, GIOCondition condition, gpointer user_data)
 	{
 		std::visit(utils::overloaded{
 		                   [&](const wivrn::from_headset::headset_info_packet & info) {
-			                   on_headset_info_packet(std::get<wivrn::from_headset::headset_info_packet>(*packet));
+			                   on_headset_info_packet(info);
 			                   inhibitor.emplace();
 			                   wivrn_server_set_headset_connected(dbus_server, true);
+		                   },
+		                   [&](const wivrn::from_headset::settings_changed & settings) {
+			                   wivrn_server_set_preferred_refresh_rate(dbus_server, settings.preferred_refresh_rate);
+			                   wivrn_server_set_bitrate(dbus_server, settings.bitrate_bps);
 		                   },
 		                   [&](const wivrn::from_headset::start_app & request) {
 			                   const auto & apps = list_applications();
 			                   if (auto it = apps.find(request.app_id); it != apps.end())
-				                   children->start_application(it->second.exec);
+			                   {
+				                   try
+				                   {
+					                   children->start_application(it->second.exec, it->second.path);
+				                   }
+				                   catch (std::exception & e)
+				                   {
+					                   std::cerr << "Failed to launch application " << it->second.name.at("") << ": " << e.what() << std::endl;
+				                   }
+			                   }
 		                   },
 		                   [&](const from_monado::headset_connected &) {
 			                   stop_publishing();
@@ -515,9 +553,13 @@ gboolean control_received(gint fd, GIOCondition condition, gpointer user_data)
 			                   start_publishing();
 			                   inhibitor.reset();
 			                   wivrn_server_set_headset_connected(dbus_server, false);
+			                   wivrn_server_set_client_tab(dbus_server, "");
 		                   },
-		                   [&](const from_monado::bitrate_changed & value) {
-			                   wivrn_server_set_bitrate(dbus_server, value.bitrate_bps);
+		                   [&](const wivrn::from_headset::stream_tab_changed & event) {
+			                   wivrn_server_set_client_tab(dbus_server, magic_enum::enum_name(event.tab).data());
+		                   },
+		                   [&](const from_monado::server_error & e) {
+			                   wivrn_server_emit_server_error(dbus_server, e.where.c_str(), e.message.c_str());
 		                   },
 		           },
 		           *packet);
@@ -635,6 +677,15 @@ gboolean on_handle_rename_key(WivrnServer * skeleton, GDBusMethodInvocation * in
 
 gboolean on_handle_enable_pairing(WivrnServer * skeleton, GDBusMethodInvocation * invocation, gpointer user_data)
 {
+	bool server_running = server_watch != 0 or connection_thread;
+	if (server_running)
+	{
+		std::cerr << "Cannot enable pairing while session is active." << pin << std::endl;
+		g_dbus_method_invocation_return_value(invocation, g_variant_new("(s)", ""));
+
+		return G_SOURCE_CONTINUE;
+	}
+
 	set_encryption_state(wivrn_connection::encryption_state::pairing);
 
 	if (pairing_timeout)
@@ -660,6 +711,29 @@ gboolean on_handle_disable_pairing(WivrnServer * skeleton, GDBusMethodInvocation
 {
 	set_encryption_state(wivrn_connection::encryption_state::enabled);
 	g_dbus_method_invocation_return_value(invocation, nullptr);
+	return G_SOURCE_CONTINUE;
+}
+
+gboolean on_handle_set_client_tab(WivrnServer * skeleton, GDBusMethodInvocation * invocation, gpointer user_data)
+{
+	GVariant * args = g_dbus_method_invocation_get_parameters(invocation);
+	char * c_tab;
+	g_variant_get_child(args, 0, "s", &c_tab);
+	std::string tab(c_tab);
+	g_free(c_tab);
+
+	for (auto [val, name]: magic_enum::enum_entries<stream_tab>())
+	{
+		if (tab == name)
+		{
+			wivrn_ipc_socket_main_loop->send(to_headset::stream_tab_change{.tab = val});
+			g_dbus_method_invocation_return_value(invocation, nullptr);
+			return G_SOURCE_CONTINUE;
+		}
+	}
+
+	std::cerr << "Invalid tab name " << tab << std::endl;
+	g_dbus_method_invocation_return_dbus_error(invocation, "io.github.wivrn.Server.InvalidTab", "invalid tab");
 	return G_SOURCE_CONTINUE;
 }
 
@@ -712,9 +786,6 @@ void on_headset_info_packet(const wivrn::from_headset::headset_info_packet & inf
 {
 	GVariantBuilder * builder;
 
-	GVariant * value_eye_size = g_variant_new("(uu)", info.recommended_eye_width, info.recommended_eye_height);
-	wivrn_server_set_recommended_eye_size(dbus_server, value_eye_size);
-
 	builder = g_variant_builder_new(G_VARIANT_TYPE("ad"));
 	for (double rate: info.available_refresh_rates)
 	{
@@ -724,7 +795,9 @@ void on_headset_info_packet(const wivrn::from_headset::headset_info_packet & inf
 	g_variant_builder_unref(builder);
 	wivrn_server_set_available_refresh_rates(dbus_server, value_refresh_rates);
 
-	wivrn_server_set_preferred_refresh_rate(dbus_server, info.preferred_refresh_rate);
+	wivrn_server_set_preferred_refresh_rate(dbus_server, info.settings.preferred_refresh_rate);
+
+	wivrn_server_set_bitrate(dbus_server, info.settings.bitrate_bps);
 
 	auto speaker = info.speaker.value_or(wivrn::from_headset::headset_info_packet::audio_description{});
 	wivrn_server_set_speaker_channels(dbus_server, speaker.num_channels);
@@ -760,17 +833,16 @@ void on_headset_info_packet(const wivrn::from_headset::headset_info_packet & inf
 	}
 	codecs.push_back(nullptr);
 	wivrn_server_set_supported_codecs(dbus_server, codecs.data());
+	wivrn_server_set_system_name(dbus_server, info.system_name.c_str());
 }
 
 void on_name_acquired(GDBusConnection * connection, const gchar * name, gpointer user_data)
 {
-#if WIVRN_USE_SYSTEMD
-	if (use_systemd)
+	try
 	{
 		children = std::make_unique<systemd_units_manager>(connection, update_fsm);
 	}
-	else
-#endif
+	catch (...)
 	{
 		children = std::make_unique<forked_children>(update_fsm);
 	}
@@ -810,6 +882,8 @@ void on_name_acquired(GDBusConnection * connection, const gchar * name, gpointer
 		                 NULL);
 	}
 
+	g_signal_connect(dbus_server, "handle-set-client-tab", G_CALLBACK(on_handle_set_client_tab), NULL);
+
 	wivrn_server_set_steam_command(dbus_server, steam_command().c_str());
 
 	on_headset_info_packet({});
@@ -839,6 +913,8 @@ void on_name_acquired(GDBusConnection * connection, const gchar * name, gpointer
 		set_encryption_state(wivrn_connection::encryption_state::pairing);
 	else
 		set_encryption_state(enc_state);
+
+	wivrn_server_set_client_tab(dbus_server, "");
 }
 
 auto create_dbus_connection()
@@ -875,7 +951,7 @@ auto create_dbus_connection()
 
 int inner_main(int argc, char * argv[], bool show_instructions)
 {
-	std::cerr << "WiVRn " << wivrn::git_version << " starting" << std::endl;
+	std::cerr << "WiVRn " << wivrn::display_version() << " starting" << std::endl;
 	if (show_instructions)
 	{
 		if (auto command = steam_command(); not command.empty())
@@ -884,9 +960,9 @@ int inner_main(int argc, char * argv[], bool show_instructions)
 
 	std::filesystem::create_directories(socket_path().parent_path());
 
+	if (do_active_runtime)
+		active_runtime::cleanup_openxr();
 	listen_socket = create_listen_socket();
-
-	u_trace_marker_init();
 
 	// Initialize main loop
 	main_loop = g_main_loop_new(nullptr, false);
@@ -895,15 +971,6 @@ int inner_main(int argc, char * argv[], bool show_instructions)
 	// avahi glib integration
 	AvahiGLibPoll * glib_poll = avahi_glib_poll_new(main_context, G_PRIORITY_DEFAULT);
 	poll_api = avahi_glib_poll_get(glib_poll);
-
-	// Create a pipe to quit monado properly
-	if (pipe(stdin_pipe_fds) < 0)
-	{
-		perror("pipe");
-		return wivrn_exit_code::cannot_create_pipe;
-	}
-	fcntl(stdin_pipe_fds[0], F_SETFD, FD_CLOEXEC);
-	fcntl(stdin_pipe_fds[1], F_SETFD, FD_CLOEXEC);
 
 	// Create a socket to report monado status to the main loop
 	if (socketpair(AF_UNIX, SOCK_DGRAM, 0, control_pipe_fds) < 0)
@@ -955,10 +1022,8 @@ int inner_main(int argc, char * argv[], bool show_instructions)
 	avahi_glib_poll_free(glib_poll);
 	g_main_loop_unref(main_loop);
 
-#if WIVRN_USE_SYSTEMD
 	std::error_code ec;
 	std::filesystem::remove(socket_path(), ec);
-#endif
 
 	return wivrn_exit_code::success;
 }
@@ -976,15 +1041,15 @@ int main(int argc, char * argv[])
 	auto no_fork = app.add_flag("--no-fork")->description("disable fork to serve connection")->group("Debug");
 	auto no_publish = app.add_flag("--no-publish-service")->description("disable publishing the service through avahi");
 	auto no_encrypt = app.add_flag("--no-encrypt")->description("disable encryption")->group("Debug");
-#if WIVRN_USE_SYSTEMD
-	app.add_flag("--systemd", use_systemd, "use systemd to launch user-configured application");
+#if WIVRN_FEATURE_DEBUG_GUI
+	auto debug_gui = app.add_flag("--debug-gui")->description("show the debug GUI")->group("Debug");
 #endif
 
 	CLI11_PARSE(app, argc, argv);
 
 	if (*version_flag)
 	{
-		std::cout << "WiVRn version " << wivrn::git_version << std::endl;
+		std::cout << "WiVRn version " << wivrn::display_version() << std::endl;
 		return 0;
 	}
 
@@ -1007,6 +1072,10 @@ int main(int argc, char * argv[])
 		publication = wivrn::service_publication::none;
 	else
 		publication = configuration().publication;
+
+#if WIVRN_FEATURE_DEBUG_GUI
+	show_debug_gui = bool(*debug_gui);
+#endif
 
 	try
 	{

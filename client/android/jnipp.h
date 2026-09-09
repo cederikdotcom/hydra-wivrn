@@ -25,6 +25,7 @@
 #include <tuple>
 
 #include <jni.h>
+#include <type_traits>
 
 namespace jni
 {
@@ -85,6 +86,31 @@ struct Void
 	constexpr static const auto call_static_method = &_JNIEnv::CallStaticVoidMethod;
 };
 
+struct Int
+{
+	constexpr static auto static_field = &_JNIEnv::GetStaticIntField;
+	constexpr static auto obj_field = &_JNIEnv::GetIntField;
+	constexpr static const auto call_method = &_JNIEnv::CallIntMethod;
+	constexpr static const auto call_static_method = &_JNIEnv::CallStaticIntMethod;
+
+	static std::string type()
+	{
+		return "I";
+	}
+
+	int value;
+
+	int handle() const
+	{
+		return value;
+	}
+
+	operator int() const
+	{
+		return value;
+	}
+};
+
 namespace details
 {
 
@@ -139,8 +165,17 @@ struct type_map<void>
 	using type = jni::Void;
 };
 
+template <>
+struct type_map<int>
+{
+	using type = jni::Int;
+};
+
 template <typename T>
 using type_map_t = type_map<T>::type;
+
+void handle_java_exception();
+
 } // namespace details
 
 struct klass
@@ -185,7 +220,17 @@ struct klass
 		assert(method_id);
 		auto handles = details::handle(std::forward<Args>(args)...);
 		return R(std::apply([&](auto &... t) {
-			return (env.*R1::call_static_method)(*this, method_id, t...);
+			if constexpr (std::is_void_v<R>)
+			{
+				(env.*R1::call_static_method)(*this, method_id, t...);
+				details::handle_java_exception();
+			}
+			else
+			{
+				auto res = (env.*R1::call_static_method)(*this, method_id, t...);
+				details::handle_java_exception();
+				return res;
+			}
 		},
 		                    handles));
 	}
@@ -224,30 +269,6 @@ struct Bool
 	}
 };
 
-struct Int
-{
-	constexpr static auto static_field = &_JNIEnv::GetStaticIntField;
-	constexpr static const auto call_method = &_JNIEnv::CallIntMethod;
-	constexpr static const auto call_static_method = &_JNIEnv::CallStaticIntMethod;
-
-	static std::string type()
-	{
-		return "I";
-	}
-
-	int value;
-
-	int handle() const
-	{
-		return value;
-	}
-
-	operator int() const
-	{
-		return value;
-	}
-};
-
 template <details::string_literal Type>
 struct object
 {
@@ -257,6 +278,7 @@ struct object
 	}
 	std::unique_ptr<std::remove_pointer_t<jobject>, details::deleter> self;
 
+	constexpr static auto obj_field = &_JNIEnv::GetObjectField;
 	constexpr static const auto call_method = &_JNIEnv::CallObjectMethod;
 	constexpr static const auto call_static_method = &_JNIEnv::CallStaticObjectMethod;
 
@@ -277,7 +299,17 @@ struct object
 		assert(method_id);
 		auto handles = details::handle(std::forward<Args>(args)...);
 		return R(std::apply([&](auto &... t) {
-			return (env.*R1::call_method)(*this, method_id, t...);
+			if constexpr (std::is_void_v<R>)
+			{
+				(env.*R1::call_method)(*this, method_id, t...);
+				details::handle_java_exception();
+			}
+			else
+			{
+				auto res = (env.*R1::call_method)(*this, method_id, t...);
+				details::handle_java_exception();
+				return res;
+			}
 		},
 		                    handles));
 	}
@@ -290,9 +322,27 @@ struct object
 		assert(method_id);
 		auto handles = details::handle(std::forward<Args>(args)...);
 		return R(std::apply([&](auto &... t) {
-			return (env.*R1::call_method)(*this, method_id, t...);
+			if constexpr (std::is_void_v<R>)
+			{
+				(env.*R1::call_method)(*this, method_id, t...);
+				details::handle_java_exception();
+			}
+			else
+			{
+				auto res = (env.*R1::call_method)(*this, method_id, t...);
+				details::handle_java_exception();
+				return res;
+			}
 		},
 		                    handles));
+	}
+
+	template <typename T>
+	T field(const std::string & name)
+	{
+		auto & env = jni_thread::env();
+		jfieldID id = env.GetFieldID(klass(), name.c_str(), T::type().c_str());
+		return T((env.*T::obj_field)(*this, id));
 	}
 
 	jobject handle() const
@@ -321,7 +371,9 @@ static object<Type> new_object(Args &&... args)
 	assert(method_id);
 	auto handles = details::handle(std::forward<Args>(args)...);
 	return object<Type>(std::apply([&](auto &... t) {
-		return env.NewObject(klass, method_id, t...);
+		auto res = env.NewObject(klass, method_id, t...);
+		details::handle_java_exception();
+		return res;
 	},
 	                               handles));
 }
@@ -332,6 +384,7 @@ struct string : public string_t
 {
 	using string_t::type;
 	constexpr static auto static_field = &_JNIEnv::GetStaticObjectField;
+	constexpr static auto obj_field = &_JNIEnv::GetObjectField;
 
 	operator jstring()
 	{

@@ -18,16 +18,18 @@
  */
 
 #include "scene.h"
+
 #include "application.h"
-#include "render/scene_loader.h"
+#include "render/scene_components.h"
 #include "utils/contains.h"
 #include "utils/i18n.h"
 #include "utils/overloaded.h"
 #include "utils/ranges.h"
+#include <cstring>
+#include <entt/core/fwd.hpp>
 #include <magic_enum.hpp>
 #include <spdlog/spdlog.h>
 #include <vulkan/vulkan_raii.hpp>
-#include <vulkan/vulkan_structs.hpp>
 #include <openxr/openxr.h>
 
 // TODO remove constants
@@ -37,7 +39,7 @@ std::vector<scene::meta *> scene::scene_registry;
 
 scene::~scene() {}
 
-scene::scene(key, const meta & current_meta, std::span<const vk::Format> supported_color_formats, std::span<const vk::Format> supported_depth_formats) :
+scene::scene(key, const meta & current_meta, std::span<const vk::Format> supported_color_formats, std::span<const vk::Format> supported_depth_formats, scene * parent_scene) :
         instance(application::instance().xr_instance),
         system(application::instance().xr_system_id),
         session(application::instance().xr_session),
@@ -47,8 +49,8 @@ scene::scene(key, const meta & current_meta, std::span<const vk::Format> support
         device(application::instance().vk_device),
         physical_device(application::instance().vk_physical_device),
         queue(application::instance().vk_queue),
-        commandpool(application::instance().vk_cmdpool),
         queue_family_index(application::instance().vk_queue_family_index),
+        commandpool(application::instance().vk_cmdpool),
         current_meta(current_meta)
 {
 	swapchain_format = vk::Format::eUndefined;
@@ -87,6 +89,19 @@ scene::scene(key, const meta & current_meta, std::span<const vk::Format> support
 	        instance.has_extension(XR_FB_COMPOSITION_LAYER_DEPTH_TEST_EXTENSION_NAME);
 
 	composition_layer_color_scale_bias_supported = instance.has_extension(XR_KHR_COMPOSITION_LAYER_COLOR_SCALE_BIAS_EXTENSION_NAME);
+
+	if (parent_scene)
+	{
+		renderer = parent_scene->renderer;
+		gltf_cache = parent_scene->gltf_cache;
+		image_cache = parent_scene->image_cache;
+	}
+	else
+	{
+		renderer = std::make_shared<scene_renderer>(device, physical_device, queue, queue_family_index);
+		gltf_cache = std::make_shared<gltf_cache_type>(device, physical_device, queue, queue_family_index, renderer->get_default_material(), application::get_cache_path() / "textures");
+		image_cache = std::make_shared<image_cache_type>(device, physical_device, queue, queue_family_index);
+	}
 }
 
 void scene::set_focused(bool status)
@@ -140,24 +155,19 @@ void scene::render_world(
         uint32_t height,
         bool keep_depth_buffer,
         uint32_t layer_mask,
-        XrColor4f clear_color)
+        XrColor4f clear_color,
+        bool render_debug_draws)
 {
-	std::vector<scene_renderer::frame_info> frames;
-	frames.reserve(views.size());
+	assert(views.size() <= layer::max_views);
+	beman::inplace_vector::inplace_vector<scene_renderer::frame_info, layer::max_views> frames;
+	beman::inplace_vector::inplace_vector<XrCompositionLayerProjectionView, layer::max_views> composition_layer_color;
+	beman::inplace_vector::inplace_vector<XrCompositionLayerDepthInfoKHR, layer::max_views> composition_layer_depth;
 
-	// TODO inplace vector
-	std::vector<XrCompositionLayerProjectionView> composition_layer_color;
-	std::vector<XrCompositionLayerDepthInfoKHR> composition_layer_depth;
-
-	composition_layer_color.reserve(views.size());
-	if (keep_depth_buffer)
-		composition_layer_depth.reserve(views.size());
-
-	auto [color_swapchain, color_image] = [&]() -> std::pair<XrSwapchain, vk::Image> {
+	auto [color_swapchain, color_image] = [&]() -> std::tuple<XrSwapchain, vk::Image> {
 		xr::swapchain & color_swapchain = get_swapchain(swapchain_format, width, height, 1, views.size());
 
 		int color_image_index = color_swapchain.acquire();
-		vk::Image color_image = color_swapchain.images()[color_image_index].image;
+		vk::Image color_image = color_swapchain.image(color_image_index);
 		color_swapchain.wait();
 		return {color_swapchain, color_image};
 	}();
@@ -168,7 +178,7 @@ void scene::render_world(
 			xr::swapchain & depth_swapchain = get_swapchain(depth_format, width, height, 1, views.size());
 
 			int depth_image_index = depth_swapchain.acquire();
-			vk::Image depth_image = depth_swapchain.images()[depth_image_index].image;
+			vk::Image depth_image = depth_swapchain.image(depth_image_index);
 			depth_swapchain.wait();
 			return {depth_swapchain, depth_image};
 		}
@@ -211,9 +221,10 @@ void scene::render_world(
 			        },
 			        .minDepth = 0,
 			        .maxDepth = 1,
-			        .nearZ = std::numeric_limits<float>::infinity(),
+			        .nearZ = std::bit_cast<float>(0x7f800000), // infinity
 			        .farZ = constants::lobby::near_plane,
 			});
+			static_assert(std::numeric_limits<float>::is_iec559);
 		}
 	}
 
@@ -228,17 +239,19 @@ void scene::render_world(
 	        depth_format,
 	        color_image,
 	        depth_image,
-	        frames);
+	        frames,
+	        render_debug_draws);
 
 	add_projection_layer(
 	        XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT,
 	        space,
-	        std::move(composition_layer_color),
-	        std::move(composition_layer_depth));
+	        composition_layer_color,
+	        composition_layer_depth);
 }
 
 xr::swapchain & scene::get_swapchain(vk::Format format, int32_t width, int32_t height, int sample_count, uint32_t array_size)
 {
+	// Look for an exact match
 	for (swapchain_entry & entry: swapchains)
 	{
 		if (not entry.used and
@@ -254,17 +267,25 @@ xr::swapchain & scene::get_swapchain(vk::Format format, int32_t width, int32_t h
 	}
 
 	spdlog::info("Creating new swapchain: {}, {}x{}, {} sample(s), {} level(s)", magic_enum::enum_name(format), width, height, sample_count, array_size);
+	swapchain_entry new_swapchain{
+	        .format = format,
+	        .width = width,
+	        .height = height,
+	        .sample_count = sample_count,
+	        .array_size = array_size,
+	        .used = true,
+	        .swapchain = xr::swapchain(
+	                instance,
+	                session,
+	                device,
+	                format,
+	                width,
+	                height,
+	                sample_count,
+	                array_size)};
+	spdlog::info("Created swapchain");
 
-	return swapchains.emplace_back(swapchain_entry{
-	                                       .format = format,
-	                                       .width = width,
-	                                       .height = height,
-	                                       .sample_count = sample_count,
-	                                       .array_size = array_size,
-	                                       .used = true,
-	                                       .swapchain = xr::swapchain(session, device, format, width, height, sample_count, array_size),
-	                               })
-	        .swapchain;
+	return swapchains.emplace_back(std::move(new_swapchain)).swapchain;
 }
 
 void scene::clear_swapchains()
@@ -307,8 +328,8 @@ void scene::render_start(bool passthrough, XrTime predicted_display_time_)
 void scene::add_projection_layer(
         XrCompositionLayerFlags flags,
         XrSpace space,
-        std::vector<XrCompositionLayerProjectionView> && color_views,
-        std::vector<XrCompositionLayerDepthInfoKHR> && depth_views)
+        std::span<XrCompositionLayerProjectionView> color_views,
+        std::span<XrCompositionLayerDepthInfoKHR> depth_views)
 {
 	layers.push_back(layer{
 	        .composition_layer = XrCompositionLayerProjection{
@@ -319,8 +340,8 @@ void scene::add_projection_layer(
 	                .viewCount = (uint32_t)color_views.size(),
 	                .views = nullptr,
 	        },
-	        .color_views = std::move(color_views),
-	        .depth_views = std::move(depth_views),
+	        .color_views{color_views.begin(), color_views.end()},
+	        .depth_views{depth_views.begin(), depth_views.end()},
 	});
 }
 
@@ -434,20 +455,157 @@ void scene::render_end()
 	session.end_frame(predicted_display_time, openxr_layers, blend_mode);
 }
 
-std::pair<entt::entity, components::node &> scene::load_gltf(const std::filesystem::path & path, uint32_t layer_mask)
+template <typename T>
+void copy_components(entt::registry & scene, const entt::registry & prefab, const std::unordered_map<entt::entity, entt::entity> & entity_map)
 {
-	auto entity = world.create();
-	auto & node = world.emplace<components::node>(entity);
+	for (const auto & [entity, component]: prefab.view<T>().each())
+	{
+		scene.emplace<T>(entity_map.at(entity), component);
+	}
+}
+
+std::pair<entt::entity, components::node &> scene::add_gltf(std::shared_ptr<entt::registry> gltf, uint32_t layer_mask)
+{
+	auto root = world.create();
+	auto & node = world.emplace<components::node>(root);
 	node.layer_mask = layer_mask;
 
-	assert(renderer);
-	scene_loader loader(device, physical_device, queue, queue_family_index, renderer->get_default_material());
+	auto prefab_entities = gltf->view<entt::entity>();
 
-	loader.add_prefab(world, loader(path), entity);
+	std::vector<entt::entity> scene_entities{prefab_entities.size()};
+	world.create(scene_entities.begin(), scene_entities.end());
 
-	return {entity, node};
+	std::unordered_map<entt::entity, entt::entity> entity_map; // key: prefab entity, value: scene entity
+
+	entity_map.emplace(entt::null, root);
+	for (auto [prefab_entity, scene_entity]: std::ranges::zip_view(prefab_entities, scene_entities))
+		entity_map.emplace(prefab_entity, scene_entity);
+
+	copy_components<components::node>(world, *gltf, entity_map);
+	copy_components<components::animation>(world, *gltf, entity_map);
+
+	// update links
+	for (auto [prefab_entity, scene_entity]: entity_map)
+	{
+		if (prefab_entity == entt::null)
+			continue;
+
+		auto * node = world.try_get<components::node>(scene_entity);
+		auto * anim = world.try_get<components::animation>(scene_entity);
+
+		if (node)
+		{
+			node->parent = entity_map.at(node->parent);
+
+			for (auto & joint: node->joints)
+			{
+				joint.first = entity_map.at(joint.first);
+			}
+		}
+
+		if (anim)
+		{
+			for (auto & track: anim->tracks)
+			{
+				std::visit(utils::overloaded{[&](auto & t) { t.target = entity_map.at(t.target); }}, track);
+			}
+		}
+	}
+
+	return {root, node};
+}
+
+std::shared_ptr<entt::registry> scene::load_gltf(const std::filesystem::path & path, std::function<void(float)> progress_cb)
+{
+	return gltf_cache->load(path, path, progress_cb);
+}
+
+void scene::unload_gltf(const std::filesystem::path & path)
+{
+	gltf_cache->remove(path);
+}
+
+std::pair<entt::entity, components::node &> scene::add_gltf(const std::filesystem::path & path, uint32_t layer_mask)
+{
+	return add_gltf(load_gltf(path), layer_mask);
+}
+
+std::shared_ptr<renderer::material> scene::create_material(std::function<void(renderer::material &)> init) const
+{
+	auto material = std::make_shared<renderer::material>(*renderer->get_default_material());
+	if (init)
+		init(*material);
+
+	material->buffer = std::make_shared<buffer_allocation>(
+	        device,
+	        vk::BufferCreateInfo{
+	                .size = sizeof(material->staging),
+	                .usage = vk::BufferUsageFlagBits::eUniformBuffer},
+	        VmaAllocationCreateInfo{
+	                .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT,
+	                .usage = VMA_MEMORY_USAGE_AUTO});
+	material->offset = 0;
+	std::memcpy(material->buffer->map(), &material->staging, sizeof(material->staging));
+	material->buffer->unmap();
+	return material;
+}
+
+void scene::remove(entt::entity entity)
+{
+	std::vector to_be_removed{entity};
+
+	while (not to_be_removed.empty())
+	{
+		entt::entity parent = to_be_removed.back();
+		to_be_removed.pop_back();
+		world.destroy(parent);
+
+		for (auto [e, node]: world.view<components::node>().each())
+		{
+			if (node.parent == parent)
+				to_be_removed.push_back(e);
+		}
+
+		for (auto [e, anim]: world.view<components::animation>().each())
+		{
+			if (std::ranges::any_of(anim.tracks,
+			                        [&](const auto & track) { return std::visit(
+				                                                  [&](const components::animation_track_base & track) {
+					                                                  return track.target == parent;
+				                                                  },
+				                                                  track); }))
+			{
+				to_be_removed.push_back(e);
+			}
+		}
+	}
 }
 
 void scene::on_unfocused() {}
 void scene::on_focused() {}
 void scene::on_xr_event(const xr::event &) {}
+
+bool scene::on_input_key_down(uint8_t key_code)
+{
+	return false;
+}
+bool scene::on_input_key_up(uint8_t key_code)
+{
+	return false;
+}
+bool scene::on_input_mouse_move(float x, float y)
+{
+	return false;
+}
+bool scene::on_input_button_down(uint8_t button)
+{
+	return false;
+}
+bool scene::on_input_button_up(uint8_t button)
+{
+	return false;
+}
+bool scene::on_input_scroll(float h, float v)
+{
+	return false;
+}

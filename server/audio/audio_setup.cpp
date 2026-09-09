@@ -22,15 +22,11 @@
 #include "util/u_logging.h"
 #include "wivrn_config.h"
 
-#if WIVRN_USE_PULSEAUDIO
-#include "audio_pulse.h"
-#endif
-
 #if WIVRN_USE_PIPEWIRE
 #include "audio_pipewire.h"
 #endif
 
-std::shared_ptr<wivrn::audio_device> wivrn::audio_device::create(
+std::unique_ptr<wivrn::audio_device> wivrn::audio_device::create(
         const std::string & source_name,
         const std::string & source_description,
         const std::string & sink_name,
@@ -40,11 +36,6 @@ std::shared_ptr<wivrn::audio_device> wivrn::audio_device::create(
 {
 #if WIVRN_USE_PIPEWIRE
 	if (auto res = create_pipewire_handle(source_name, source_description, sink_name, sink_description, info, session))
-		return res;
-#endif
-
-#if WIVRN_USE_PULSEAUDIO
-	if (auto res = create_pulse_handle(source_name, source_description, sink_name, sink_description, info, session))
 		return res;
 #endif
 	U_LOG_W("No audio backend available");

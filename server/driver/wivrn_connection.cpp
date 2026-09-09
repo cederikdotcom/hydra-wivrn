@@ -34,15 +34,11 @@
 
 using namespace std::chrono_literals;
 
-static void handle_event_from_main_loop(to_monado::disconnect)
-{
-	// Ignore disconnect request when no headset is connected
-}
-
-static void handle_event_from_main_loop(to_monado::set_bitrate)
-{
-	// Ignore bitrate request when no headset is connected
-}
+// Ignored until connection is established
+static void handle_event_from_main_loop(to_monado::stop) {}
+static void handle_event_from_main_loop(to_monado::disconnect) {}
+static void handle_event_from_main_loop(to_monado::set_bitrate) {}
+static void handle_event_from_main_loop(wivrn::to_headset::stream_tab_change) {}
 
 static std::string clean_key(std::string key)
 {
@@ -264,7 +260,8 @@ void wivrn::wivrn_connection::init(std::stop_token stop_token, std::function<voi
 
 	if (client_port >= 0)
 	{
-		stream.connect(client_address.sin6_addr, client_port);
+		client_address.sin6_port = htons(client_port);
+		stream.connect(client_address);
 		stream.set_send_buffer_size(1024 * 1024 * 5);
 	}
 	else
@@ -288,13 +285,13 @@ void wivrn::wivrn_connection::init(std::stop_token stop_token, std::function<voi
 		wivrn::update_last_connection_timestamp(clean_key(headset_key.public_key()));
 }
 
-void wivrn::wivrn_connection::reset(TCP && tcp, std::function<void()> tick)
+void wivrn::wivrn_connection::reset(std::stop_token stop, TCP && tcp, std::function<void()> tick)
 {
 	if (stream)
 		stream = decltype(stream)();
 
 	control = std::move(tcp);
-	init({}, tick);
+	init(stop, tick);
 }
 
 void wivrn::wivrn_connection::shutdown()

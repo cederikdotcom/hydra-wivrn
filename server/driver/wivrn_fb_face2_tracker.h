@@ -47,12 +47,14 @@ struct wivrn_fb_face2_data
 	// the old sample from before opening the Quest menu
 	// would be too old to be considered for interpolation
 	bool is_eye_following_blendshapes_valid;
+
+	int64_t time;
 };
 
 class fb_face2_list : public history<fb_face2_list, wivrn_fb_face2_data>
 {
 public:
-	static wivrn_fb_face2_data interpolate(const wivrn_fb_face2_data & a, const wivrn_fb_face2_data & b, float t)
+	wivrn_fb_face2_data interpolate(const wivrn_fb_face2_data & a, const wivrn_fb_face2_data & b, float t)
 	{
 		if (not a.is_valid)
 		{
@@ -78,9 +80,9 @@ public:
 		return result;
 	}
 
-	bool update_tracking(const XrTime & production_timestamp, const XrTime & timestamp, const wivrn_fb_face2_data & data, const clock_offset & offset)
+	void update_tracking(const XrTime & production_timestamp, const XrTime & timestamp, const wivrn_fb_face2_data & data, const clock_offset & offset)
 	{
-		return this->add_sample(production_timestamp, timestamp, data, offset);
+		add_sample(production_timestamp, timestamp, data, offset);
 	}
 };
 
@@ -92,7 +94,7 @@ class wivrn_fb_face2_tracker : public xrt_device
 	wivrn::wivrn_session & cnx;
 
 public:
-	using base = xrt_device;
+	using base_t = xrt_device;
 	wivrn_fb_face2_tracker(xrt_device * hmd, wivrn::wivrn_session & cnx);
 
 	xrt_result_t update_inputs();

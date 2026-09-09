@@ -38,6 +38,8 @@ class wivrn_session;
 
 struct wivrn_htc_face_data
 {
+	int64_t eye_sample_time;
+	int64_t lip_sample_time;
 	std::array<float, XRT_FACIAL_EXPRESSION_EYE_COUNT_HTC> eye;
 	std::array<float, XRT_FACIAL_EXPRESSION_LIP_COUNT_HTC> lip;
 	bool eye_active;
@@ -47,7 +49,7 @@ struct wivrn_htc_face_data
 class htc_face_list : public history<htc_face_list, wivrn_htc_face_data>
 {
 public:
-	static wivrn_htc_face_data interpolate(const wivrn_htc_face_data & a, const wivrn_htc_face_data & b, float t)
+	wivrn_htc_face_data interpolate(const wivrn_htc_face_data & a, const wivrn_htc_face_data & b, float t)
 	{
 		wivrn_htc_face_data result = b;
 
@@ -91,9 +93,9 @@ public:
 		return result;
 	}
 
-	bool update_tracking(const XrTime & production_timestamp, const XrTime & timestamp, const wivrn_htc_face_data & data, const clock_offset & offset)
+	void update_tracking(const XrTime & production_timestamp, const XrTime & timestamp, const wivrn_htc_face_data & data, const clock_offset & offset)
 	{
-		return this->add_sample(production_timestamp, timestamp, data, offset);
+		add_sample(production_timestamp, timestamp, data, offset);
 	}
 };
 
@@ -105,7 +107,7 @@ class wivrn_htc_face_tracker : public xrt_device
 	wivrn::wivrn_session & cnx;
 
 public:
-	using base = xrt_device;
+	using base_t = xrt_device;
 	wivrn_htc_face_tracker(xrt_device * hmd, wivrn::wivrn_session & cnx);
 
 	xrt_result_t update_inputs();

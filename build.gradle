@@ -4,7 +4,7 @@ buildscript {
         mavenCentral()
     }
     dependencies {
-        classpath 'com.android.tools.build:gradle:8.12.1'
+        classpath 'com.android.tools.build:gradle:8.13.0'
     }
 }
 
@@ -92,11 +92,11 @@ tasks.register("generatePngs", GeneratePngsTask) {
     }
 }
 
-
+def use_asan = project.hasProperty('wivrn_address_sanitizer') && wivrn_address_sanitizer == 'ON'
 
 android {
     namespace = "org.meumeu.wivrn"
-    ndkVersion = "28.1.13356709"
+    ndkVersion = "29.0.14206865"
 
     lint {
         disable += "ExpiredTargetSdkVersion"
@@ -107,25 +107,33 @@ android {
         // for Vulkan, need at least 24
         // for AImage_getHardwareBuffer, API 26
         minSdkVersion 29
-        compileSdkVersion 32
+        compileSdkVersion 34
         targetSdkVersion 32 // for Oculus Store
 
         versionName = project.hasProperty('wivrn_version') ? wivrn_version : "1.0"
         versionCode = project.hasProperty('wivrn_versionCode') ? wivrn_versionCode.toInteger() : 1
         def showImguiDemo = project.hasProperty('wivrn_show_imgui_demo') ? wivrn_show_imgui_demo : 'OFF'
         def showDebugMenu = project.hasProperty('wivrn_show_debug_menu') ? wivrn_show_debug_menu : 'OFF'
+        def compressGlb = project.hasProperty('wivrn_compress_glb') ? wivrn_compress_glb : 'OFF'
+        def fetchcontentBaseDir = project.hasProperty('fetchcontent_base_dir') ? ['-DFETCHCONTENT_BASE_DIR=' + fetchcontent_base_dir] : []
+
+        def asan = use_asan ? 'ON': 'OFF'
+        def stl = use_asan ? 'c++_shared' : "c++_static"
 
         externalNativeBuild {
             def css = project.hasProperty('wivrn_css') ? project.wivrn_css: "images/wivrn-local.css"
 
             cmake {
-                arguments '-DANDROID_TOOLCHAIN=clang',
-                          '-DANDROID_STL=c++_static',
+                arguments  = ['-DANDROID_TOOLCHAIN=clang',
+                          '-DANDROID_STL=' + stl,
                           '-DCMAKE_ANDROID_NDK_VERSION=' + ndkVersion,
                           '-DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON',
                           '-DCMAKE_EXPORT_COMPILE_COMMANDS=ON',
+                          '-DCMAKE_ANDROID_ASSETS_DIRECTORIES=' + layout.buildDirectory.dir("assets").get().asFile,
+                          '-DRESOURCES_DIRECTORIES=' + layout.buildDirectory.dir("resources").get().asFile,
                           '-DWIVRN_USE_SYSTEM_BOOST=OFF',
                           '-DWIVRN_USE_SYSTEM_FREETYPE=OFF',
+                          '-DWIVRN_USE_ANDROID_BIN_LIBKTX=ON',
                           '-DWIVRN_BUILD_CLIENT=ON',
                           '-DWIVRN_BUILD_SERVER=OFF',
                           '-DWIVRN_BUILD_SERVER_LIBRARY=OFF',
@@ -134,8 +142,19 @@ android {
                           '-DWIVRN_WERROR=ON',
                           '-DWIVRN_SHOW_IMGUI_DEMO_WINDOW=' + showImguiDemo,
                           '-DWIVRN_CLIENT_DEBUG_MENU=' + showDebugMenu,
-                          '-DWIVRN_CSS=' + css
+                          '-DWIVRN_CSS=' + css,
+                          '-DWIVRN_COMPRESS_GLB=' + compressGlb,
+                          '-DWIVRN_ADDRESS_SANITIZER=' + asan,
+                          ] +
+                          fetchcontentBaseDir
                 resValue "string", "app_name", project.hasProperty('wivrn_app_name') ? project.wivrn_app_name : "WiVRn Local"
+                abiFilters 'arm64-v8a'//, 'x86_64'
+            }
+
+        }
+        packaging {
+            jniLibs {
+                useLegacyPackaging = use_asan
             }
         }
     }
@@ -193,59 +212,8 @@ android {
             initWith debug
             externalNativeBuild {
                 cmake {
-                    arguments '-DUSE_ANDROID_VALIDATION_LAYER=ON'
+                    arguments '-DWIVRN_USE_ANDROID_VALIDATION_LAYER=ON'
                 }
-            }
-        }
-    }
-
-    flavorDimensions "device"
-
-    productFlavors {
-        standard {
-            dimension "device"
-            externalNativeBuild {
-                cmake {
-                    abiFilters 'arm64-v8a'//, 'x86_64'
-                }
-            }
-        }
-    }
-
-    sourceSets {
-        main {
-            manifest.srcFile 'AndroidManifest.xml'
-            java.srcDirs = ['client/java']
-            res.srcDirs = [ 'resources', layout.buildDirectory.dir('generated_resources') ]
-
-            assets.srcDirs 'assets'
-        }
-    }
-
-    externalNativeBuild {
-        cmake {
-            version = '3.30.3'
-            path    'CMakeLists.txt'
-        }
-    }
-
-    tasks["preBuild"].dependsOn "generatePngs"
-
-    applicationVariants.all { variant ->
-        // It probably works with merge${variant.name.capitalize()}Assets too
-        tasks["generate${variant.name.capitalize()}Assets"].dependsOn "externalNativeBuild${variant.name.capitalize()}"
-    }
-
-    productFlavors.all { variant ->
-        sourceSets {
-            "${variant.name}" {
-                assets.srcDirs layout.buildDirectory.dir("assets${variant.name.capitalize()}")
-            }
-        }
-
-        externalNativeBuild{
-            cmake {
-                arguments '-DCMAKE_ANDROID_ASSETS_DIRECTORIES=' + layout.buildDirectory.dir("assets${variant.name.capitalize()}").get().asFile
             }
         }
     }
@@ -259,8 +227,34 @@ android {
 
         externalNativeBuild{
             cmake {
-                arguments '-DCMAKE_ANDROID_LIB_DIRECTORIES=' + layout.buildDirectory.dir("libs${variant.name.capitalize()}").get().asFile
+                arguments '-DANDROID_LIB_DIRECTORIES=' + layout.buildDirectory.dir("libs${variant.name.capitalize()}").get().asFile
             }
         }
+    }
+
+    sourceSets {
+        main {
+            manifest.srcFile 'AndroidManifest.xml'
+            java.srcDirs = ['client/java']
+            res.srcDirs = [ 'resources', layout.buildDirectory.dir('generated_resources') ]
+            resources.srcDirs = [layout.buildDirectory.dir('resources')]
+
+            assets.srcDirs = ['assets', layout.buildDirectory.dir("assets")]
+        }
+    }
+
+    externalNativeBuild {
+        cmake {
+            version = '3.31.5'
+            path    'CMakeLists.txt'
+        }
+    }
+
+    tasks["preBuild"].dependsOn "generatePngs"
+
+    applicationVariants.all { variant ->
+        // It probably works with merge${variant.name.capitalize()}Assets too
+        tasks["generate${variant.name.capitalize()}Assets"].dependsOn "externalNativeBuild${variant.name.capitalize()}"
+        tasks["merge${variant.name.capitalize()}Resources"].dependsOn "externalNativeBuild${variant.name.capitalize()}"
     }
 }

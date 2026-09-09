@@ -65,7 +65,6 @@ private:
 	vk::raii::Sampler rgb_sampler = nullptr;
 
 	std::array<image, image_count> decoded_images;
-	vk::Extent2D extent{};
 	std::vector<int> free_images;
 
 	std::unique_ptr<AVCodecContext, void (*)(AVCodecContext *)> codec;
@@ -74,13 +73,14 @@ private:
 	uint64_t frame_index;
 	std::weak_ptr<scenes::stream> weak_scene;
 	shard_accumulator * accumulator;
+	const vk::Extent2D extent;
 
 	std::mutex mutex;
 
 public:
 	decoder(vk::raii::Device & device,
 	        vk::raii::PhysicalDevice & physical_device,
-	        const wivrn::to_headset::video_stream_description::item & description,
+	        const wivrn::to_headset::video_stream_description & description,
 	        uint8_t stream_index,
 	        std::weak_ptr<scenes::stream> scene,
 	        shard_accumulator * accumulator);
@@ -94,11 +94,6 @@ public:
 	vk::Sampler sampler() override
 	{
 		return *rgb_sampler;
-	}
-
-	vk::Extent2D image_size()
-	{
-		return extent;
 	}
 
 	static void supported_codecs(std::vector<wivrn::video_codec> &);

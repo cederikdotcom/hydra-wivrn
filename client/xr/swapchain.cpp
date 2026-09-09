@@ -22,7 +22,19 @@
 #include "details/enumerate.h"
 #include "session.h"
 
-xr::swapchain::swapchain(xr::session & s, vk::raii::Device & device, vk::Format format, int32_t width, int32_t height, int sample_count, uint32_t array_size)
+xr::swapchain::swapchain(
+        xr::instance & inst,
+        xr::session & s,
+        vk::raii::Device & device,
+        vk::Format format,
+        int32_t width,
+        int32_t height,
+        int sample_count,
+        uint32_t array_size) :
+        width_(width),
+        height_(height),
+        sample_count_(sample_count),
+        format_(format)
 {
 	assert(sample_count == 1);
 
@@ -56,19 +68,13 @@ xr::swapchain::swapchain(xr::session & s, vk::raii::Device & device, vk::Format 
 	        .mipCount = 1,
 	};
 
-	width_ = width;
-	height_ = height;
-	sample_count_ = sample_count;
-	format_ = format;
-
 	CHECK_XR(xrCreateSwapchain(s, &create_info, &id));
 
-	std::vector<XrSwapchainImageVulkanKHR> array =
-	        details::enumerate<XrSwapchainImageVulkanKHR>(xrEnumerateSwapchainImages, id);
+	auto images = details::enumerate<XrSwapchainImageVulkanKHR>(xrEnumerateSwapchainImages, id);
 
-	images_.resize(array.size());
-	for (uint32_t i = 0; i < array.size(); i++)
-		images_[i].image = array[i].image;
+	images_.reserve(images.size());
+	for (auto & image: images)
+		images_.push_back(image.image);
 }
 
 int xr::swapchain::acquire()

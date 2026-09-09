@@ -7,24 +7,38 @@ set(KTX_FEATURE_LOADTEST_APPS OFF)
 
 set(FASTGLTF_COMPILE_AS_CPP20 ON)
 
-FetchContent_MakeAvailable(simdjson spdlog glm fastgltf imgui stb implot uni-algo entt)
+set(SPIRV_REFLECT_EXECUTABLE OFF)
+set(SPIRV_REFLECT_STATIC_LIB ON)
+set(SPIRV_REFLECT_INSTALL OFF)
 
-if (WIVRN_USE_LIBKTX)
+FetchContent_MakeAvailable(simdjson spdlog glm fastgltf imgui stb implot uni-algo entt spirv-reflect)
+if(ANDROID AND WIVRN_USE_ANDROID_BIN_LIBKTX)
+    if(NOT EXISTS ${FETCHCONTENT_BASE_DIR}/KTX-Software-${KTX_VERSION}-Android.zip)
+        file(DOWNLOAD
+            https://github.com/KhronosGroup/KTX-Software/releases/download/${KTX_VERSION_FULL}/KTX-Software-${KTX_VERSION}-Android.zip
+            ${FETCHCONTENT_BASE_DIR}/KTX-Software-${KTX_VERSION}-Android.zip
+            EXPECTED_HASH SHA256=9f84a395f37a185e2e21e77cfd3893e67271b616edf5feb39125f09ab4c06b29
+            )
+    endif()
+    file(ARCHIVE_EXTRACT INPUT ${FETCHCONTENT_BASE_DIR}/KTX-Software-${KTX_VERSION}-Android.zip DESTINATION ${FETCHCONTENT_BASE_DIR})
+    add_library(ktx INTERFACE)
+    target_link_libraries(ktx INTERFACE ${FETCHCONTENT_BASE_DIR}/KTX-Software-${KTX_VERSION}-Android/${ANDROID_ABI}/lib/libktx.so)
+    target_include_directories(ktx INTERFACE ${FETCHCONTENT_BASE_DIR}/KTX-Software-${KTX_VERSION}-Android/${ANDROID_ABI}/include)
+elseif(WIVRN_USE_SYSTEM_LIBKTX AND NOT ANDROID)
+else()
     FetchContent_MakeAvailable(libktx)
-endif()
-
-if (NOT WIVRN_USE_SYSTEM_BOOST)
-    FetchContent_MakeAvailable(boost)
 endif()
 
 include(FreetypeHarfbuzz)
 include(CompileGLSL)
+include(GenerateAssets)
 include(I18n)
 
 add_library(stb INTERFACE)
 target_include_directories(stb INTERFACE ${stb_SOURCE_DIR})
 
 if(ANDROID)
+    file(REMOVE_RECURSE ${RESOURCES_DIRECTORIES}/lib ${ANDROID_LIB_DIRECTORIES})
     add_library(wivrn MODULE)
 
     find_library(ANDROID_LIBRARY NAMES android REQUIRED)
@@ -37,10 +51,29 @@ if(ANDROID)
     FetchContent_MakeAvailable(openxr_loader)
     target_link_libraries(wivrn openxr_loader)
 
+    # libcurl
+    set(BUILD_CURL_EXE OFF)
+    set(BUILD_TESTING OFF)
+    set(CURL_DISABLE_INSTALL ON)
+    set(CURL_USE_LIBPSL OFF)
+    set(CURL_USE_LIBSSH2 OFF)
+    set(BUILD_EXAMPLES OFF)
+
+    FetchContent_MakeAvailable(curl)
+    target_link_libraries(wivrn libcurl_static)
 
     target_link_libraries(wivrn native_app_glue)
     target_compile_definitions(wivrn PRIVATE -DXR_USE_PLATFORM_ANDROID -DVK_USE_PLATFORM_ANDROID_KHR)
     target_link_options(wivrn PRIVATE -Wl,--undefined=ANativeActivity_onCreate)
+
+    target_link_options(wivrn
+        PRIVATE
+        -Wl,--version-script,${CMAKE_CURRENT_SOURCE_DIR}/android/exported_symbols.txt
+        # This causes the linker to emit an error when a version script names a
+        # symbol that is not found, rather than silently ignoring that line.
+        -Wl,--no-undefined-version
+    )
+    set_target_properties(wivrn PROPERTIES LINK_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/android/exported_symbols.txt)
 
     file(GLOB PLATFORM_SOURCE CONFIGURE_DEPENDS
         "android/*.cpp"
@@ -48,6 +81,23 @@ if(ANDROID)
         "decoder/android/*.cpp"
         )
     target_sources(wivrn PRIVATE ${PLATFORM_SOURCE})
+
+    if (WIVRN_ADDRESS_SANITIZER)
+        file(MAKE_DIRECTORY
+            ${RESOURCES_DIRECTORIES}/lib/${CMAKE_ANDROID_ARCH_ABI}
+            ${ANDROID_LIB_DIRECTORIES}/${CMAKE_ANDROID_ARCH_ABI})
+        file(GLOB _asan_location
+            ${ANDROID_NDK}/toolchains/llvm/prebuilt/linux-x86_64/lib/clang/*/lib/linux/libclang_rt.asan-${CMAKE_SYSTEM_PROCESSOR}-android.so
+        )
+        file(COPY
+            ${_asan_location}
+            DESTINATION ${ANDROID_LIB_DIRECTORIES}/${CMAKE_ANDROID_ARCH_ABI}
+        )
+        file(COPY_FILE
+            ${ANDROID_NDK}/wrap.sh/asan.sh
+            ${RESOURCES_DIRECTORIES}/lib/${CMAKE_ANDROID_ARCH_ABI}/wrap.sh
+        )
+    endif()
 else()
     add_executable(wivrn)
 
@@ -58,8 +108,7 @@ else()
         target_link_libraries(wivrn openxr_loader)
     endif()
 
-    target_link_libraries(wivrn PkgConfig::LIBAV Fontconfig::Fontconfig)
-
+    target_link_libraries(wivrn PkgConfig::LIBAV_CLIENT Fontconfig::Fontconfig CURL::libcurl)
 
     file(GLOB PLATFORM_SOURCE CONFIGURE_DEPENDS
         "decoder/ffmpeg/*.cpp")
@@ -74,8 +123,6 @@ endif()
 # Main sources
 #
 target_compile_definitions(wivrn PRIVATE "XR_USE_TIMESPEC=1")
-
-set_target_properties(wivrn PROPERTIES CXX_VISIBILITY_PRESET hidden)
 
 file(GLOB LOCAL_SOURCE CONFIGURE_DEPENDS
     "*.cpp"
@@ -100,8 +147,10 @@ target_link_libraries(wivrn
     FreetypeHarfbuzz
     glm::glm
     imspinner
+    ktx
     simdjson
     spdlog::spdlog
+    spirv-reflect-static
     stb
     uni-algo
     Vulkan::Vulkan
@@ -110,13 +159,10 @@ target_link_libraries(wivrn
     pyrowave
 )
 
-if (WIVRN_USE_LIBKTX)
-    target_link_libraries(wivrn ktx_read)
-endif()
-
 target_compile_definitions(wivrn PRIVATE -DXR_USE_GRAPHICS_API_VULKAN)
 target_compile_definitions(wivrn PRIVATE -DVMA_STATS_STRING_ENABLED=0)
 target_compile_definitions(wivrn PRIVATE -DGLM_ENABLE_EXPERIMENTAL)
+target_compile_definitions(wivrn PRIVATE IMGUI_DEFINE_MATH_OPERATORS)
 
 target_include_directories(wivrn PRIVATE .)
 
@@ -148,7 +194,7 @@ target_compile_definitions(wivrn-imgui PUBLIC IMGUI_ENABLE_FREETYPE)
 # target_compile_definitions(wivrn-imgui PUBLIC IMGUI_DISABLE_OBSOLETE_FUNCTIONS) # incompatible with implot
 # target_compile_definitions(wivrn-imgui PUBLIC IMGUI_ENABLE_FREETYPE_LUNASVG)
 target_compile_features(wivrn-imgui PRIVATE cxx_std_23)
-target_link_libraries(wivrn-imgui FreetypeHarfbuzz)
+target_link_libraries(wivrn-imgui FreetypeHarfbuzz Vulkan::Vulkan)
 
 target_link_libraries(wivrn wivrn-imgui)
 
@@ -167,25 +213,26 @@ khronos_validation.enables = VK_VALIDATION_FEATURE_ENABLE_THREAD_SAFETY_EXT
 ")
 endif()
 
-if(USE_ANDROID_VALIDATION_LAYER)
+if(WIVRN_USE_ANDROID_VALIDATION_LAYER)
     set(VVL_VERSION "1.4.321.0")
 
-    if(NOT EXISTS ${CMAKE_BINARY_DIR}/Vulkan-ValidationLayers-${VVL_VERSION}.zip)
+    if(NOT EXISTS ${FETCHCONTENT_BASE_DIR}/Vulkan-ValidationLayers-${VVL_VERSION}.zip)
         if (EXISTS ${CMAKE_SOURCE_DIR}/Vulkan-ValidationLayers-${VVL_VERSION}.zip)
-            file(CREATE_LINK ${CMAKE_SOURCE_DIR}/Vulkan-ValidationLayers-${VVL_VERSION}.zip ${CMAKE_BINARY_DIR}/Vulkan-ValidationLayers-${VVL_VERSION}.zip SYMBOLIC)
+            file(CREATE_LINK ${CMAKE_SOURCE_DIR}/Vulkan-ValidationLayers-${VVL_VERSION}.zip ${FETCHCONTENT_BASE_DIR}/Vulkan-ValidationLayers-${VVL_VERSION}.zip SYMBOLIC)
         else()
-            file(DOWNLOAD https://github.com/KhronosGroup/Vulkan-ValidationLayers/releases/download/vulkan-sdk-${VVL_VERSION}/android-binaries-${VVL_VERSION}.zip ${CMAKE_BINARY_DIR}/Vulkan-ValidationLayers-${VVL_VERSION}.zip
-                EXPECTED_HASH SHA256=75f2881ba7af0507c8cec13b4bf6c95556c6333485cdb8be41f608fccf762128)
+            file(DOWNLOAD https://github.com/KhronosGroup/Vulkan-ValidationLayers/releases/download/vulkan-sdk-${VVL_VERSION}/android-binaries-${VVL_VERSION}.zip
+                 ${FETCHCONTENT_BASE_DIR}/Vulkan-ValidationLayers-${VVL_VERSION}.zip
+                 EXPECTED_HASH SHA256=75f2881ba7af0507c8cec13b4bf6c95556c6333485cdb8be41f608fccf762128)
         endif()
     endif()
 
     set(VVL_ZIPFILE ${CMAKE_CURRENT_SOURCE_DIR}/Vulkan-ValidationLayers-${VVL_VERSION}.zip)
 
-    file(ARCHIVE_EXTRACT INPUT ${CMAKE_BINARY_DIR}/Vulkan-ValidationLayers-${VVL_VERSION}.zip DESTINATION ${CMAKE_BINARY_DIR}/Vulkan-ValidationLayer)
+    file(ARCHIVE_EXTRACT INPUT ${FETCHCONTENT_BASE_DIR}/Vulkan-ValidationLayers-${VVL_VERSION}.zip DESTINATION ${FETCHCONTENT_BASE_DIR}/Vulkan-ValidationLayer)
 
     file(COPY
-        ${CMAKE_BINARY_DIR}/Vulkan-ValidationLayer/android-binaries-${VVL_VERSION}/${CMAKE_ANDROID_ARCH_ABI}
-        DESTINATION ${CMAKE_ANDROID_LIB_DIRECTORIES})
+        ${FETCHCONTENT_BASE_DIR}/Vulkan-ValidationLayer/android-binaries-${VVL_VERSION}/${CMAKE_ANDROID_ARCH_ABI}
+        DESTINATION ${ANDROID_LIB_DIRECTORIES})
 endif()
 
 
@@ -223,61 +270,48 @@ endif()
 
 
 ##############################################################################
-# Generate assets from SVGs
+# Generate assets
 #
 file(REAL_PATH ${WIVRN_CSS} WIVRN_CSS_ABS BASE_DIRECTORY "${CMAKE_SOURCE_DIR}")
-set(RSVG_OPTS "--stylesheet=${WIVRN_CSS_ABS}")
 
-set(IMG_SRC_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../images)
-set(AST_SRC_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../assets)
+set(IMAGES_SRC_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../images)
+set(ASSETS_SRC_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../assets-source)
 
-add_custom_command(OUTPUT ${ASSETS_DIR}/wivrn.png
-    COMMAND ${RSVG_CONVERT} ${IMG_SRC_DIR}/wivrn.svg -w 540 -h 540 -o ${ASSETS_DIR}/wivrn.png ${RSVG_OPTS}
-    DEPENDS ${IMG_SRC_DIR}/wivrn.svg ${WIVRN_CSS_ABS})
+wivrn_rasterize_svg(SOURCE ${IMAGES_SRC_DIR}/wivrn.svg               DESTINATION ${CMAKE_CURRENT_BINARY_DIR}/wivrn.png               WIDTH 540 HEIGHT 540 CSS ${WIVRN_CSS_ABS})
+wivrn_rasterize_svg(SOURCE ${IMAGES_SRC_DIR}/wivrn-pride.svg         DESTINATION ${CMAKE_CURRENT_BINARY_DIR}/wivrn-pride.png         WIDTH 540 HEIGHT 540 CSS ${WIVRN_CSS_ABS})
+wivrn_rasterize_svg(SOURCE ${IMAGES_SRC_DIR}/wivrn-christmas.svg     DESTINATION ${CMAKE_CURRENT_BINARY_DIR}/wivrn-christmas.png     WIDTH 540 HEIGHT 540 CSS ${WIVRN_CSS_ABS})
+wivrn_rasterize_svg(SOURCE ${ASSETS_SRC_DIR}/passthrough.svg         DESTINATION ${CMAKE_CURRENT_BINARY_DIR}/passthrough.png         WIDTH 256 HEIGHT 256)
+wivrn_rasterize_svg(SOURCE ${ASSETS_SRC_DIR}/default-environment.svg DESTINATION ${CMAKE_CURRENT_BINARY_DIR}/default-environment.png WIDTH 256 HEIGHT 256)
 
-add_custom_command(OUTPUT ${ASSETS_DIR}/wivrn-pride.png
-    COMMAND ${RSVG_CONVERT} ${IMG_SRC_DIR}/wivrn-pride.svg -w 540 -h 540 -o ${ASSETS_DIR}/wivrn-pride.png ${RSVG_OPTS}
-    DEPENDS ${IMG_SRC_DIR}/wivrn-pride.svg ${WIVRN_CSS_ABS})
-
-add_custom_target(assets ALL DEPENDS
-    ${ASSETS_DIR}/wivrn.png
-    ${ASSETS_DIR}/wivrn-pride.png
-)
-
-add_dependencies(wivrn assets)
-
-if(ANDROID)
-    find_program(TOKTX toktx REQUIRED)
-    add_custom_command(OUTPUT ${ASSETS_DIR}/wivrn.ktx2
-        COMMAND ${TOKTX} --encode astc --astc_blk_d 4x4 --astc_quality 100 --genmipmap ${ASSETS_DIR}/wivrn.ktx2 ${ASSETS_DIR}/wivrn.png
-        DEPENDS ${ASSETS_DIR}/wivrn.png)
-    add_custom_command(OUTPUT ${ASSETS_DIR}/wivrn-pride.ktx2
-        COMMAND ${TOKTX} --encode astc --astc_blk_d 4x4 --astc_quality 100 --genmipmap ${ASSETS_DIR}/wivrn-pride.ktx2 ${ASSETS_DIR}/wivrn-pride.png
-        DEPENDS ${ASSETS_DIR}/wivrn-pride.png)
-
-    add_custom_command(OUTPUT ${ASSETS_DIR}/default_icon.ktx2
-        COMMAND ${TOKTX} --encode astc --astc_blk_d 4x4 --astc_quality 100 --genmipmap ${ASSETS_DIR}/wivrn-pride.ktx2 ${ASSETS_DIR}/default_icon.png
-        DEPENDS ${ASSETS_DIR}/default_icon.png)
-
-    add_custom_command(OUTPUT ${ASSETS_DIR}/WoodFloor051_1K-JPG_Color.ktx2
-        COMMAND ${TOKTX} --encode astc --astc_blk_d 12x12 --astc_quality 100 --genmipmap ${ASSETS_DIR}/WoodFloor051_1K-JPG_Color.ktx2 ${AST_SRC_DIR}/WoodFloor051_1K-JPG_Color.jpg
-        DEPENDS ${AST_SRC_DIR}/WoodFloor051_1K-JPG_Color.jpg)
-
-    add_custom_command(OUTPUT ${ASSETS_DIR}/vr_splash.png
-        COMMAND ${CMAKE_COMMAND} -E copy ${ASSETS_DIR}/wivrn.png ${ASSETS_DIR}/vr_splash.png
-        DEPENDS ${ASSETS_DIR}/wivrn.png)
-
-    add_custom_target(assets-android ALL DEPENDS
-        ${ASSETS_DIR}/wivrn.ktx2
-        ${ASSETS_DIR}/wivrn-pride.ktx2
-        ${ASSETS_DIR}/WoodFloor051_1K-JPG_Color.ktx2
-        ${ASSETS_DIR}/vr_splash.png
-    )
-    add_dependencies(assets-android assets)
-    add_dependencies(wivrn assets-android)
+wivrn_generate_ktx(        SOURCE ${CMAKE_CURRENT_BINARY_DIR}/wivrn.png                 DESTINATION ${ASSETS_DIR}/wivrn.ktx2                          TARGET wivrn)
+wivrn_generate_ktx(        SOURCE ${CMAKE_CURRENT_BINARY_DIR}/wivrn-pride.png           DESTINATION ${ASSETS_DIR}/wivrn-pride.ktx2                    TARGET wivrn)
+wivrn_generate_ktx(        SOURCE ${CMAKE_CURRENT_BINARY_DIR}/wivrn-christmas.png       DESTINATION ${ASSETS_DIR}/wivrn-christmas.ktx2                TARGET wivrn)
+wivrn_generate_ktx(        SOURCE ${ASSETS_SRC_DIR}/default_icon.png                    DESTINATION ${ASSETS_DIR}/default_icon.ktx2                   TARGET wivrn)
+wivrn_generate_ktx(        SOURCE ${CMAKE_CURRENT_BINARY_DIR}/passthrough.png           DESTINATION ${ASSETS_DIR}/passthrough.ktx2                    TARGET wivrn)
+wivrn_generate_ktx(        SOURCE ${CMAKE_CURRENT_BINARY_DIR}/default-environment.png   DESTINATION ${ASSETS_DIR}/default-environment.ktx2            TARGET wivrn)
+if(WIVRN_COMPRESS_GLB)
+    wivrn_gltf_transform_uastc(SOURCE ${ASSETS_SRC_DIR}/ground.glb                      DESTINATION ${ASSETS_DIR}/ground.glb                          TARGET wivrn ZSTD 20)
+else()
+    wivrn_copy_file(       SOURCE ${ASSETS_SRC_DIR}/ground.glb                          DESTINATION ${ASSETS_DIR}/ground.glb                          TARGET wivrn)
 endif()
 
+wivrn_webxr_download()
+wivrn_webxr_controller(PROFILE generic-trigger-squeeze DESTINATION ${ASSETS_DIR}/controllers TARGET wivrn)
+wivrn_webxr_controller(PROFILE htc-vive-focus-3        DESTINATION ${ASSETS_DIR}/controllers TARGET wivrn)
+wivrn_webxr_controller(PROFILE meta-quest-touch-plus   DESTINATION ${ASSETS_DIR}/controllers TARGET wivrn)
+wivrn_webxr_controller(PROFILE meta-quest-touch-pro    DESTINATION ${ASSETS_DIR}/controllers TARGET wivrn)
+wivrn_webxr_controller(PROFILE oculus-touch-v2         DESTINATION ${ASSETS_DIR}/controllers TARGET wivrn)
+wivrn_webxr_controller(PROFILE oculus-touch-v3         DESTINATION ${ASSETS_DIR}/controllers TARGET wivrn)
+wivrn_webxr_controller(PROFILE pico-4                  DESTINATION ${ASSETS_DIR}/controllers TARGET wivrn)
+wivrn_webxr_controller(PROFILE pico-4u                 DESTINATION ${ASSETS_DIR}/controllers TARGET wivrn)
+wivrn_webxr_controller(PROFILE pico-neo3               DESTINATION ${ASSETS_DIR}/controllers TARGET wivrn)
+wivrn_webxr_controller(PROFILE samsung-galaxyxr        DESTINATION ${ASSETS_DIR}/controllers TARGET wivrn)
+wivrn_webxr_controller(PROFILE yvr-touch-v2            DESTINATION ${ASSETS_DIR}/controllers TARGET wivrn)
 
+# Add the VR splash screen (only used on Quest)
+if(ANDROID)
+    wivrn_copy_file(SOURCE ${CMAKE_CURRENT_BINARY_DIR}/wivrn.png DESTINATION ${ASSETS_DIR}/vr_splash.png TARGET wivrn)
+endif()
 
 ##############################################################################
 # Copy the assets to be able to find them when started from the build

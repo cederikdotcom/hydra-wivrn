@@ -33,11 +33,12 @@ struct audio_device
 	// unpublishes the device
 	virtual ~audio_device() = default;
 
-	virtual wivrn::to_headset::audio_stream_description description() const = 0;
-
 	virtual void process_mic_data(wivrn::audio_data &&) = 0;
 
-	static std::shared_ptr<audio_device> create(
+	virtual void pause() = 0;
+	virtual void resume() = 0;
+
+	static std::unique_ptr<audio_device> create(
 	        const std::string & source_name,
 	        const std::string & source_description,
 	        const std::string & sink_name,

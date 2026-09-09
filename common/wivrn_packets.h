@@ -22,115 +22,144 @@
 #include <array>
 #include <chrono>
 #include <cstdint>
+#include <magic_enum.hpp>
 #include <netinet/in.h>
 #include <openssl/aes.h>
 #include <optional>
 #include <span>
 #include <string>
+#include <type_traits>
 #include <variant>
 #include <vector>
-#include <vulkan/vulkan_core.h>
 #include <openxr/openxr.h>
 
+#include "packed_quaternion.h"
 #include "smp.h"
 #include "wivrn_serialization_types.h"
 
 namespace wivrn
 {
 
-// Default port for server to listen, both TCP and UDP
-static const int default_port = 9757;
-
 static constexpr int protocol_revision = 1;
 
 enum class device_id : uint8_t
 {
-	HEAD,                     // /user/head
-	LEFT_CONTROLLER_HAPTIC,   // /user/hand/left/output/haptic
-	RIGHT_CONTROLLER_HAPTIC,  // /user/hand/right/output/haptic
-	LEFT_TRIGGER_HAPTIC,      // /user/hand/left/output/haptic_trigger
-	RIGHT_TRIGGER_HAPTIC,     // /user/hand/right/output/haptic_trigger
-	LEFT_THUMB_HAPTIC,        // /user/hand/left/output/haptic_thumb
-	RIGHT_THUMB_HAPTIC,       // /user/hand/right/output/haptic_thumb
-	LEFT_GRIP,                // /user/hand/left/input/grip/pose
-	LEFT_AIM,                 // /user/hand/left/input/aim/pose
-	LEFT_PALM,                // /user/hand/left/palm_ext/pose
-	RIGHT_GRIP,               // /user/hand/right/input/grip/pose
-	RIGHT_AIM,                // /user/hand/right/input/aim/pose
-	RIGHT_PALM,               // /user/hand/right/palm_ext/pose
-	X_CLICK,                  // /user/hand/left/input/x/click
-	X_TOUCH,                  // /user/hand/left/input/x/touch
-	Y_CLICK,                  // /user/hand/left/input/y/click
-	Y_TOUCH,                  // /user/hand/left/input/y/touch
-	MENU_CLICK,               // /user/hand/left/input/menu/click
-	LEFT_SQUEEZE_CLICK,       // /user/hand/left/input/squeeze/click
-	LEFT_SQUEEZE_FORCE,       // /user/hand/left/input/squeeze/force
-	LEFT_SQUEEZE_VALUE,       // /user/hand/left/input/squeeze/value
-	LEFT_TRIGGER_CLICK,       // /user/hand/left/input/trigger/click
-	LEFT_TRIGGER_VALUE,       // /user/hand/left/input/trigger/value
-	LEFT_TRIGGER_TOUCH,       // /user/hand/left/input/trigger/touch
-	LEFT_TRIGGER_PROXIMITY,   // /user/hand/left/input/trigger/proximity
-	LEFT_TRIGGER_CURL,        // /user/hand/left/input/trigger/curl_fb
-	LEFT_TRIGGER_SLIDE,       // /user/hand/left/input/trigger/slide_fb
-	LEFT_TRIGGER_FORCE,       // /user/hand/left/input/trigger/force
-	LEFT_THUMBSTICK_X,        // /user/hand/left/input/thumbstick/x
-	LEFT_THUMBSTICK_Y,        // /user/hand/left/input/thumbstick/y
-	LEFT_THUMBSTICK_CLICK,    // /user/hand/left/input/thumbstick/click
-	LEFT_THUMBSTICK_TOUCH,    // /user/hand/left/input/thumbstick/touch
-	LEFT_THUMBREST_TOUCH,     // /user/hand/left/input/thumbrest/touch
-	LEFT_THUMBREST_FORCE,     // /user/hand/left/input/thumbrest/force
-	LEFT_THUMB_PROXIMITY,     // /user/hand/left/input/thumb_resting_surfaces/proximity
-	LEFT_TRACKPAD_X,          // /user/hand/left/input/trackpad/x
-	LEFT_TRACKPAD_Y,          // /user/hand/left/input/trackpad/y
-	LEFT_TRACKPAD_CLICK,      // /user/hand/left/input/trackpad/click
-	LEFT_TRACKPAD_TOUCH,      // /user/hand/left/input/trackpad/touch
-	LEFT_TRACKPAD_FORCE,      // /user/hand/left/input/trackpad/force
-	LEFT_STYLUS_FORCE,        // /user/hand/left/input/stylus_fb/force
-	LEFT_PINCH_POSE,          // /user/hand/left/input/pinch_ext/pose
-	LEFT_PINCH_VALUE,         // /user/hand/left/input/pinch_ext/value
-	LEFT_PINCH_READY,         // /user/hand/left/input/pinch_ext/ready_ext
-	LEFT_POKE,                // /user/hand/left/input/poke_ext/pose
-	LEFT_AIM_ACTIVATE_VALUE,  // /user/hand/left/input/aim_activate_ext/value
-	LEFT_AIM_ACTIVATE_READY,  // /user/hand/left/input/aim_activate_ext/ready_ext
-	LEFT_GRASP_VALUE,         // /user/hand/left/input/grasp_ext/value
-	LEFT_GRASP_READY,         // /user/hand/left/input/grasp_ext/ready_ext
-	A_CLICK,                  // /user/hand/right/input/a/click
-	A_TOUCH,                  // /user/hand/right/input/a/touch
-	B_CLICK,                  // /user/hand/right/input/b/click
-	B_TOUCH,                  // /user/hand/right/input/b/touch
-	SYSTEM_CLICK,             // /user/hand/right/input/system/click
-	RIGHT_SQUEEZE_CLICK,      // /user/hand/right/input/squeeze/click
-	RIGHT_SQUEEZE_FORCE,      // /user/hand/right/input/squeeze/force
-	RIGHT_SQUEEZE_VALUE,      // /user/hand/right/input/squeeze/value
-	RIGHT_TRIGGER_CLICK,      // /user/hand/right/input/trigger/click
-	RIGHT_TRIGGER_VALUE,      // /user/hand/right/input/trigger/value
-	RIGHT_TRIGGER_TOUCH,      // /user/hand/right/input/trigger/touch
-	RIGHT_TRIGGER_PROXIMITY,  // /user/hand/right/input/trigger/proximity
-	RIGHT_TRIGGER_CURL,       // /user/hand/right/input/trigger/curl_fb
-	RIGHT_TRIGGER_SLIDE,      // /user/hand/right/input/trigger/slide_fb
-	RIGHT_TRIGGER_FORCE,      // /user/hand/right/input/trigger/force
-	RIGHT_THUMBSTICK_X,       // /user/hand/right/input/thumbstick/x
-	RIGHT_THUMBSTICK_Y,       // /user/hand/right/input/thumbstick/y
-	RIGHT_THUMBSTICK_CLICK,   // /user/hand/right/input/thumbstick/click
-	RIGHT_THUMBSTICK_TOUCH,   // /user/hand/right/input/thumbstick/touch
-	RIGHT_THUMBREST_TOUCH,    // /user/hand/right/input/thumbrest/touch
-	RIGHT_THUMBREST_FORCE,    // /user/hand/right/input/thumbrest/force
-	RIGHT_THUMB_PROXIMITY,    // /user/hand/right/input/thumb_resting_surfaces/proximity
-	RIGHT_TRACKPAD_X,         // /user/hand/right/input/trackpad/x
-	RIGHT_TRACKPAD_Y,         // /user/hand/right/input/trackpad/y
-	RIGHT_TRACKPAD_CLICK,     // /user/hand/right/input/trackpad/click
-	RIGHT_TRACKPAD_TOUCH,     // /user/hand/right/input/trackpad/touch
-	RIGHT_TRACKPAD_FORCE,     // /user/hand/right/input/trackpad/force
-	RIGHT_STYLUS_FORCE,       // /user/hand/right/input/stylus_fb/force
-	RIGHT_PINCH_POSE,         // /user/hand/right/input/pinch_ext/pose
-	RIGHT_PINCH_VALUE,        // /user/hand/right/input/pinch_ext/value
-	RIGHT_PINCH_READY,        // /user/hand/right/input/pinch_ext/ready_ext
-	RIGHT_POKE,               // /user/hand/right/input/poke_ext/pose
-	RIGHT_AIM_ACTIVATE_VALUE, // /user/hand/right/input/aim_activate_ext/value
-	RIGHT_AIM_ACTIVATE_READY, // /user/hand/right/input/aim_activate_ext/ready_ext
-	RIGHT_GRASP_VALUE,        // /user/hand/right/input/grasp_ext/value
-	RIGHT_GRASP_READY,        // /user/hand/right/input/grasp_ext/ready_ext
-	EYE_GAZE,                 // /user/eyes_ext/input/gaze_ext/pose
+	HEAD,                         // /user/head
+	LEFT_CONTROLLER_HAPTIC,       // /user/hand/left/output/haptic
+	RIGHT_CONTROLLER_HAPTIC,      // /user/hand/right/output/haptic
+	LEFT_TRIGGER_HAPTIC,          // /user/hand/left/output/haptic_trigger
+	RIGHT_TRIGGER_HAPTIC,         // /user/hand/right/output/haptic_trigger
+	LEFT_THUMB_HAPTIC,            // /user/hand/left/output/haptic_thumb
+	RIGHT_THUMB_HAPTIC,           // /user/hand/right/output/haptic_thumb
+	GAMEPAD_HAPTIC_LEFT,          // /user/gamepad/output/haptic_left
+	GAMEPAD_HAPTIC_RIGHT,         // /user/gamepad/output/haptic_right
+	GAMEPAD_HAPTIC_LEFT_TRIGGER,  // /user/gamepad/output/haptic_left_trigger
+	GAMEPAD_HAPTIC_RIGHT_TRIGGER, // /user/gamepad/output/haptic_right_trigger
+	LEFT_GRIP,                    // /user/hand/left/input/grip/pose
+	LEFT_AIM,                     // /user/hand/left/input/aim/pose
+	LEFT_PALM,                    // /user/hand/left/palm_ext/pose
+	RIGHT_GRIP,                   // /user/hand/right/input/grip/pose
+	RIGHT_AIM,                    // /user/hand/right/input/aim/pose
+	RIGHT_PALM,                   // /user/hand/right/palm_ext/pose
+	X_CLICK,                      // /user/hand/left/input/x/click
+	X_TOUCH,                      // /user/hand/left/input/x/touch
+	Y_CLICK,                      // /user/hand/left/input/y/click
+	Y_TOUCH,                      // /user/hand/left/input/y/touch
+	MENU_CLICK,                   // /user/hand/left/input/menu/click
+	LEFT_SQUEEZE_CLICK,           // /user/hand/left/input/squeeze/click
+	LEFT_SQUEEZE_FORCE,           // /user/hand/left/input/squeeze/force
+	LEFT_SQUEEZE_VALUE,           // /user/hand/left/input/squeeze/value
+	LEFT_TRIGGER_CLICK,           // /user/hand/left/input/trigger/click
+	LEFT_TRIGGER_VALUE,           // /user/hand/left/input/trigger/value
+	LEFT_TRIGGER_TOUCH,           // /user/hand/left/input/trigger/touch
+	LEFT_TRIGGER_PROXIMITY,       // /user/hand/left/input/trigger/proximity
+	LEFT_TRIGGER_CURL,            // /user/hand/left/input/trigger/curl_fb
+	LEFT_TRIGGER_SLIDE,           // /user/hand/left/input/trigger/slide_fb
+	LEFT_TRIGGER_FORCE,           // /user/hand/left/input/trigger/force
+	LEFT_THUMBSTICK_X,            // /user/hand/left/input/thumbstick/x
+	LEFT_THUMBSTICK_Y,            // /user/hand/left/input/thumbstick/y
+	LEFT_THUMBSTICK_CLICK,        // /user/hand/left/input/thumbstick/click
+	LEFT_THUMBSTICK_TOUCH,        // /user/hand/left/input/thumbstick/touch
+	LEFT_THUMBREST_TOUCH,         // /user/hand/left/input/thumbrest/touch
+	LEFT_THUMBREST_FORCE,         // /user/hand/left/input/thumbrest/force
+	LEFT_THUMB_PROXIMITY,         // /user/hand/left/input/thumb_resting_surfaces/proximity
+	LEFT_TRACKPAD_X,              // /user/hand/left/input/trackpad/x
+	LEFT_TRACKPAD_Y,              // /user/hand/left/input/trackpad/y
+	LEFT_TRACKPAD_CLICK,          // /user/hand/left/input/trackpad/click
+	LEFT_TRACKPAD_TOUCH,          // /user/hand/left/input/trackpad/touch
+	LEFT_TRACKPAD_FORCE,          // /user/hand/left/input/trackpad/force
+	LEFT_STYLUS_FORCE,            // /user/hand/left/input/stylus_fb/force
+	LEFT_PINCH_POSE,              // /user/hand/left/input/pinch_ext/pose
+	LEFT_PINCH_VALUE,             // /user/hand/left/input/pinch_ext/value
+	LEFT_PINCH_READY,             // /user/hand/left/input/pinch_ext/ready_ext
+	LEFT_POKE,                    // /user/hand/left/input/poke_ext/pose
+	LEFT_AIM_ACTIVATE_VALUE,      // /user/hand/left/input/aim_activate_ext/value
+	LEFT_AIM_ACTIVATE_READY,      // /user/hand/left/input/aim_activate_ext/ready_ext
+	LEFT_GRASP_VALUE,             // /user/hand/left/input/grasp_ext/value
+	LEFT_GRASP_READY,             // /user/hand/left/input/grasp_ext/ready_ext
+	A_CLICK,                      // /user/hand/right/input/a/click
+	A_TOUCH,                      // /user/hand/right/input/a/touch
+	B_CLICK,                      // /user/hand/right/input/b/click
+	B_TOUCH,                      // /user/hand/right/input/b/touch
+	SYSTEM_CLICK,                 // /user/hand/right/input/system/click
+	RIGHT_SQUEEZE_CLICK,          // /user/hand/right/input/squeeze/click
+	RIGHT_SQUEEZE_FORCE,          // /user/hand/right/input/squeeze/force
+	RIGHT_SQUEEZE_VALUE,          // /user/hand/right/input/squeeze/value
+	RIGHT_TRIGGER_CLICK,          // /user/hand/right/input/trigger/click
+	RIGHT_TRIGGER_VALUE,          // /user/hand/right/input/trigger/value
+	RIGHT_TRIGGER_TOUCH,          // /user/hand/right/input/trigger/touch
+	RIGHT_TRIGGER_PROXIMITY,      // /user/hand/right/input/trigger/proximity
+	RIGHT_TRIGGER_CURL,           // /user/hand/right/input/trigger/curl_fb
+	RIGHT_TRIGGER_SLIDE,          // /user/hand/right/input/trigger/slide_fb
+	RIGHT_TRIGGER_FORCE,          // /user/hand/right/input/trigger/force
+	RIGHT_THUMBSTICK_X,           // /user/hand/right/input/thumbstick/x
+	RIGHT_THUMBSTICK_Y,           // /user/hand/right/input/thumbstick/y
+	RIGHT_THUMBSTICK_CLICK,       // /user/hand/right/input/thumbstick/click
+	RIGHT_THUMBSTICK_TOUCH,       // /user/hand/right/input/thumbstick/touch
+	RIGHT_THUMBREST_TOUCH,        // /user/hand/right/input/thumbrest/touch
+	RIGHT_THUMBREST_FORCE,        // /user/hand/right/input/thumbrest/force
+	RIGHT_THUMB_PROXIMITY,        // /user/hand/right/input/thumb_resting_surfaces/proximity
+	RIGHT_TRACKPAD_X,             // /user/hand/right/input/trackpad/x
+	RIGHT_TRACKPAD_Y,             // /user/hand/right/input/trackpad/y
+	RIGHT_TRACKPAD_CLICK,         // /user/hand/right/input/trackpad/click
+	RIGHT_TRACKPAD_TOUCH,         // /user/hand/right/input/trackpad/touch
+	RIGHT_TRACKPAD_FORCE,         // /user/hand/right/input/trackpad/force
+	RIGHT_STYLUS_FORCE,           // /user/hand/right/input/stylus_fb/force
+	RIGHT_PINCH_POSE,             // /user/hand/right/input/pinch_ext/pose
+	RIGHT_PINCH_VALUE,            // /user/hand/right/input/pinch_ext/value
+	RIGHT_PINCH_READY,            // /user/hand/right/input/pinch_ext/ready_ext
+	RIGHT_POKE,                   // /user/hand/right/input/poke_ext/pose
+	RIGHT_AIM_ACTIVATE_VALUE,     // /user/hand/right/input/aim_activate_ext/value
+	RIGHT_AIM_ACTIVATE_READY,     // /user/hand/right/input/aim_activate_ext/ready_ext
+	RIGHT_GRASP_VALUE,            // /user/hand/right/input/grasp_ext/value
+	RIGHT_GRASP_READY,            // /user/hand/right/input/grasp_ext/ready_ext
+	EYE_GAZE,                     // /user/eyes_ext/input/gaze_ext/pose
+	LEFT_HAND,                    // identify hand tracking
+	RIGHT_HAND,                   // identify hand tracking
+	BODY,                         // identify body tracking
+	FACE,                         // identify face tracking
+
+	// Gamepad, microsoft/xbox_controller profile (/user/gamepad)
+	GAMEPAD_MENU_CLICK,             // /user/gamepad/input/menu/click
+	GAMEPAD_VIEW_CLICK,             // /user/gamepad/input/view/click
+	GAMEPAD_A_CLICK,                // /user/gamepad/input/a/click
+	GAMEPAD_B_CLICK,                // /user/gamepad/input/b/click
+	GAMEPAD_X_CLICK,                // /user/gamepad/input/x/click
+	GAMEPAD_Y_CLICK,                // /user/gamepad/input/y/click
+	GAMEPAD_DPAD_DOWN_CLICK,        // /user/gamepad/input/dpad_down/click
+	GAMEPAD_DPAD_RIGHT_CLICK,       // /user/gamepad/input/dpad_right/click
+	GAMEPAD_DPAD_UP_CLICK,          // /user/gamepad/input/dpad_up/click
+	GAMEPAD_DPAD_LEFT_CLICK,        // /user/gamepad/input/dpad_left/click
+	GAMEPAD_SHOULDER_LEFT_CLICK,    // /user/gamepad/input/shoulder_left/click
+	GAMEPAD_SHOULDER_RIGHT_CLICK,   // /user/gamepad/input/shoulder_right/click
+	GAMEPAD_THUMBSTICK_LEFT_CLICK,  // /user/gamepad/input/thumbstick_left/click
+	GAMEPAD_THUMBSTICK_RIGHT_CLICK, // /user/gamepad/input/thumbstick_right/click
+	GAMEPAD_TRIGGER_LEFT_VALUE,     // /user/gamepad/input/trigger_left/value
+	GAMEPAD_TRIGGER_RIGHT_VALUE,    // /user/gamepad/input/trigger_right/value
+	GAMEPAD_THUMBSTICK_LEFT_X,      // /user/gamepad/input/thumbstick_left/x
+	GAMEPAD_THUMBSTICK_LEFT_Y,      // /user/gamepad/input/thumbstick_left/y
+	GAMEPAD_THUMBSTICK_RIGHT_X,     // /user/gamepad/input/thumbstick_right/x
+	GAMEPAD_THUMBSTICK_RIGHT_Y,     // /user/gamepad/input/thumbstick_right/y
 };
 
 enum class interaction_profile : uint8_t
@@ -158,6 +187,7 @@ enum class interaction_profile : uint8_t
 	meta_touch_controller_rift_cv1,
 	meta_touch_controller_quest_1_rift_s,
 	meta_touch_controller_quest_2,
+	yvr_touch_controller_yvr,
 	samsung_odyssey_controller,
 	valve_index_controller,
 };
@@ -168,7 +198,20 @@ enum video_codec
 	h265,
 	hevc = h265,
 	av1,
+	raw,
 	pyrowave,
+};
+
+enum class stream_tab : uint8_t
+{
+	hidden,
+	overlay_only,
+	compact,
+	stats,
+	settings,
+	foveation_settings,
+	applications,
+	application_launcher,
 };
 
 struct audio_data
@@ -211,19 +254,63 @@ struct visibility_mask_changed
 	uint8_t view_index;
 };
 
-enum face_type : uint8_t
+enum class face_type : uint8_t
 {
 	none,
+	android,
 	fb2,
 	htc,
 };
 
+enum class body_type : uint8_t
+{
+	none,
+	fb,
+	meta,
+	bd,
+	htc,
+};
+
+enum class body_part_mask : uint32_t
+{
+	chest = 1 << 0,
+	left_elbow = 1 << 1,
+	right_elbow = 1 << 2,
+	hip = 1 << 3,
+	left_knee = 1 << 4,
+	right_knee = 1 << 5,
+	left_foot = 1 << 6,
+	right_foot = 1 << 7,
+	max,
+};
+
+struct settings_changed
+{
+	float preferred_refresh_rate;
+	// for automatic
+	float minimum_refresh_rate;
+
+	uint32_t fps_divider = 1;
+	uint32_t bitrate_bps;
+
+	// Whether the server should mirror the gamepad to a virtual uinput device;
+	// gamepad inputs are always forwarded for the OpenXR path
+	bool mirror_gamepad = false;
+	// which virtual trackers should be enabled for body tracking
+	std::underlying_type_t<body_part_mask> enabled_body_parts;
+};
+
 struct headset_info_packet
 {
-	uint32_t recommended_eye_width;
-	uint32_t recommended_eye_height;
+	uint16_t render_eye_width;
+	uint16_t render_eye_height;
+	uint16_t stream_eye_width;
+	uint16_t stream_eye_height;
 	std::vector<float> available_refresh_rates;
-	float preferred_refresh_rate;
+
+	// runtime configurable settings
+	settings_changed settings;
+
 	struct audio_description
 	{
 		uint8_t num_channels;
@@ -235,10 +322,14 @@ struct headset_info_packet
 	bool hand_tracking;
 	bool eye_gaze;
 	bool palm_pose;
+	bool user_presence;
 	bool passthrough;
 	face_type face_tracking;
+	body_type body_tracking;
+	// htc body only
 	uint32_t num_generic_trackers;
 	std::vector<video_codec> supported_codecs; // from preferred to least preferred
+	std::optional<uint8_t> bit_depth;
 	std::string system_name;
 
 	// Used for the application list
@@ -252,18 +343,37 @@ struct handshake
 	// Sending this on TCP means connection will be TCP only
 };
 
+enum pose_flags : uint8_t
+{
+	orientation_valid = 1 << 0,
+	position_valid = 1 << 1,
+	linear_velocity_valid = 1 << 2,
+	angular_velocity_valid = 1 << 3,
+	orientation_tracked = 1 << 4,
+	position_tracked = 1 << 5
+};
+
+inline uint8_t to_pose_flags(XrSpaceLocationFlags location_flags, XrSpaceVelocityFlags velocity_flags = 0)
+{
+	uint8_t flags{};
+	if (location_flags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT)
+		flags |= pose_flags::orientation_valid;
+	if (location_flags & XR_SPACE_LOCATION_POSITION_VALID_BIT)
+		flags |= pose_flags::position_valid;
+	if (location_flags & XR_SPACE_LOCATION_ORIENTATION_TRACKED_BIT)
+		flags |= pose_flags::orientation_tracked;
+	if (location_flags & XR_SPACE_LOCATION_POSITION_TRACKED_BIT)
+		flags |= pose_flags::position_tracked;
+
+	if (velocity_flags & XR_SPACE_VELOCITY_LINEAR_VALID_BIT)
+		flags |= pose_flags::linear_velocity_valid;
+	if (velocity_flags & XR_SPACE_VELOCITY_ANGULAR_VALID_BIT)
+		flags |= pose_flags::angular_velocity_valid;
+	return flags;
+}
+
 struct tracking
 {
-	enum flags : uint8_t
-	{
-		orientation_valid = 1 << 0,
-		position_valid = 1 << 1,
-		linear_velocity_valid = 1 << 2,
-		angular_velocity_valid = 1 << 3,
-		orientation_tracked = 1 << 4,
-		position_tracked = 1 << 5
-	};
-
 	enum state_flags : uint8_t
 	{
 		recentered = 1 << 0,
@@ -285,6 +395,9 @@ struct tracking
 		XrFovf fov;
 	};
 
+	// /user/hand/left, /user/hand/right and /user/gamepad
+	std::array<interaction_profile, 3> interaction_profiles;
+
 	XrTime production_timestamp;
 	XrTime timestamp;
 	XrViewStateFlags view_flags;
@@ -294,8 +407,19 @@ struct tracking
 	std::array<view, 2> views;
 	std::vector<pose> device_poses;
 
+	struct android_face
+	{
+		std::array<float, XR_FACE_PARAMETER_COUNT_ANDROID> parameters;
+		std::array<float, XR_FACE_REGION_CONFIDENCE_COUNT_ANDROID> confidences;
+		XrFaceTrackingStateANDROID state;
+		XrTime sample_time;
+		bool is_calibrated;
+		bool is_valid;
+	};
+
 	struct fb_face2
 	{
+		XrTime time;
 		std::array<float, XR_FACE_EXPRESSION2_COUNT_FB> weights;
 		std::array<float, XR_FACE_CONFIDENCE2_COUNT_FB> confidences;
 		bool is_valid;
@@ -304,20 +428,15 @@ struct tracking
 
 	struct htc_face
 	{
+		XrTime eye_sample_time;
+		XrTime lip_sample_time;
 		std::array<float, XR_FACIAL_EXPRESSION_EYE_COUNT_HTC> eye;
 		std::array<float, XR_FACIAL_EXPRESSION_LIP_COUNT_HTC> lip;
 		bool eye_active;
 		bool lip_active;
 	};
 
-	std::variant<std::monostate, fb_face2, htc_face> face;
-};
-
-struct trackings
-{
-	// /user/hand/left and /user/hand/right
-	std::array<interaction_profile, 2> interaction_profiles;
-	std::vector<tracking> items;
+	std::variant<std::monostate, android_face, fb_face2, htc_face> face;
 };
 
 struct derived_pose
@@ -329,15 +448,6 @@ struct derived_pose
 
 struct hand_tracking
 {
-	enum flags : uint8_t
-	{
-		orientation_valid = 1 << 0,
-		position_valid = 1 << 1,
-		linear_velocity_valid = 1 << 2,
-		angular_velocity_valid = 1 << 3,
-		orientation_tracked = 1 << 4,
-		position_tracked = 1 << 5
-	};
 	enum hand_id : uint8_t
 	{
 		left,
@@ -345,7 +455,8 @@ struct hand_tracking
 	};
 	struct pose
 	{
-		XrPosef pose;
+		XrVector3f position;
+		packed_quaternion orientation;
 		XrVector3f linear_velocity;
 		XrVector3f angular_velocity;
 		// In order to avoid packet fragmentation
@@ -360,26 +471,85 @@ struct hand_tracking
 	std::optional<std::array<pose, XR_HAND_JOINT_COUNT_EXT>> joints;
 };
 
-struct body_tracking
+struct meta_body
 {
-	inline static const size_t max_tracked_poses = 16;
-	enum flags : uint8_t
-	{
-		orientation_valid = 1 << 0,
-		position_valid = 1 << 1,
-		orientation_tracked = 1 << 2,
-		position_tracked = 1 << 3,
-	};
 	struct pose
 	{
-		XrPosef pose{};
-		// maybe add velocity?
-		uint8_t flags{0};
+		XrVector3f position;
+		packed_quaternion orientation;
+		uint8_t flags;
+	};
+	struct packed_pose
+	{
+		struct
+		{
+			int16_t x, y, z; // 10th of mm relative to root
+		} position;
+		packed_quaternion orientation;
+		uint8_t flags;
 	};
 
 	XrTime production_timestamp;
 	XrTime timestamp;
-	std::optional<std::array<pose, max_tracked_poses>> poses;
+	float confidence;
+
+	struct fb_joints
+	{
+		pose root;
+		// excluding root
+		std::array<packed_pose, XR_BODY_JOINT_COUNT_FB - 1> joints;
+	};
+	struct meta_joints
+	{
+		pose root;
+		// excluding root
+		std::array<packed_pose, XR_FULL_BODY_JOINT_COUNT_META - 1> joints;
+	};
+	std::variant<std::monostate, fb_joints, meta_joints> joints;
+};
+
+struct meta_body_skeleton
+{
+	struct fb_skeleton
+	{
+		std::array<XrBodySkeletonJointFB, XR_BODY_JOINT_COUNT_FB> joints;
+	};
+	struct meta_skeleton
+	{
+		std::array<XrBodySkeletonJointFB, XR_FULL_BODY_JOINT_COUNT_META> joints;
+	};
+	std::variant<fb_skeleton, meta_skeleton> skeleton;
+};
+
+struct bd_body
+{
+	struct pose
+	{
+		XrVector3f position;
+		packed_quaternion orientation;
+		uint8_t flags;
+	};
+
+	bool all_tracked;
+	XrTime production_timestamp;
+	XrTime timestamp;
+	std::array<pose, XR_BODY_JOINT_COUNT_BD> joints;
+};
+
+struct htc_body
+{
+	static constexpr size_t max_tracked_poses = 16;
+	struct pose
+	{
+		XrPosef pose;
+		XrVector3f linear_velocity;
+		XrVector3f angular_velocity;
+		uint8_t flags;
+	};
+
+	XrTime production_timestamp;
+	XrTime timestamp;
+	std::array<pose, max_tracked_poses> poses;
 };
 
 struct inputs
@@ -391,6 +561,47 @@ struct inputs
 		XrTime last_change_time;
 	};
 	std::vector<input_value> values;
+};
+
+struct hid
+{
+	struct button_down
+	{
+		uint8_t button;
+	};
+
+	struct button_up
+	{
+		uint8_t button;
+	};
+
+	struct mouse_move
+	{
+		float x;
+		float y;
+	};
+
+	struct mouse_scroll
+	{
+		float h;
+		float v;
+	};
+
+	struct key_down
+	{
+		uint8_t key;
+	};
+
+	struct key_up
+	{
+		uint8_t key;
+	};
+
+	using input_t = std::variant<button_down, button_up, mouse_move, mouse_scroll, key_down, key_up>;
+	struct input
+	{
+		input_t input_data;
+	};
 };
 
 struct timesync_response
@@ -440,6 +651,12 @@ struct session_state_changed
 struct user_presence_changed
 {
 	bool present;
+	XrTime change_time;
+};
+
+struct stream_tab_changed
+{
+	stream_tab tab;
 };
 
 struct override_foveation_center
@@ -461,19 +678,36 @@ struct start_app
 	std::string app_id;
 };
 
+struct get_running_applications
+{};
+
+struct set_active_application
+{
+	uint32_t id;
+};
+
+struct stop_application
+{
+	uint32_t id;
+};
+
+// when changing this, also make sure there are handlers in wivrn_session, etc. or compilation will fail
 using packets = std::variant<
         crypto_handshake,
         pin_check_1,
         pin_check_3,
         headset_info_packet,
+        settings_changed,
         feedback,
         audio_data,
         handshake,
         tracking,
-        trackings,
         derived_pose,
         hand_tracking,
-        body_tracking,
+        meta_body,
+        meta_body_skeleton,
+        bd_body,
+        htc_body,
         inputs,
         timesync_response,
         battery,
@@ -481,9 +715,14 @@ using packets = std::variant<
         refresh_rate_changed,
         session_state_changed,
         user_presence_changed,
+        stream_tab_changed,
         override_foveation_center,
         get_application_list,
-        start_app>;
+        start_app,
+        get_running_applications,
+        set_active_application,
+        hid::input,
+        stop_application>;
 } // namespace from_headset
 
 namespace to_headset
@@ -520,6 +759,22 @@ struct handshake
 	int stream_port;
 };
 
+struct server_message
+{
+	enum class kind : uint8_t
+	{
+		// in-stream toasts (not buffered)
+		toast,
+		toast_urgent,
+
+		// displayed in lobby after disconnect (buffered)
+		error,
+	};
+
+	kind kind;
+	std::string msg;
+};
+
 struct foveation_parameter
 {
 	// The number of source pixels for each ratio,
@@ -549,52 +804,30 @@ struct audio_stream_description
 
 struct video_stream_description
 {
-	enum class channels_t
-	{
-		colour,
-		alpha,
-	};
-	struct item
-	{
-		// useful dimensions of the video stream
-		uint16_t width;
-		uint16_t height;
-		// dimensions of the video, may include padding at the end
-		uint16_t video_width;
-		uint16_t video_height;
-		uint16_t offset_x;
-		uint16_t offset_y;
-		video_codec codec;
-		channels_t channels;
-		uint8_t subsampling; // applies to width/height only, offsets are in full size pixels
-		std::optional<VkSamplerYcbcrRange> range;
-		std::optional<VkSamplerYcbcrModelConversion> color_model;
-	};
+	// dimensions of the video stream per eye
+	// alpha is half resolution
 	uint16_t width;
 	uint16_t height;
-	float fps;
-	uint16_t defoveated_width;
-	uint16_t defoveated_height;
-	std::vector<item> items;
+	std::array<video_codec, 3> codec; // left, right, alpha
+	float frame_rate;
+	float refresh_rate;
+
+	bool operator==(const video_stream_description &) const = default;
 };
 
 class video_stream_data_shard
 {
 public:
 	inline static const size_t max_payload_size = 1400;
-	enum flags : uint8_t
-	{
-		start_of_slice = 1,
-		end_of_slice = 1 << 1,
-		end_of_frame = 1 << 2,
-	};
-	// Identifier of stream in video_stream_description
+	// Identifier of stream:
+	// 0 left
+	// 1 right
+	// 2 alpha
 	uint8_t stream_item_idx;
 	// Counter increased for each frame
 	uint64_t frame_idx;
 	// Identifier of the shard within the frame
 	uint16_t shard_idx;
-	uint8_t flags;
 
 	// Position information, must be present on first video shard
 	struct view_info_t
@@ -641,35 +874,35 @@ struct timesync_query
 
 struct tracking_control
 {
-	enum class id
+	struct sample
 	{
-		left_aim,
-		left_grip,
-		left_palm,
-		left_pinch,
-		left_poke,
-		right_aim,
-		right_grip,
-		right_palm,
-		right_pinch,
-		right_poke,
-		left_hand,
-		right_hand,
-		face,
-		generic_tracker,
-		battery,
-		microphone,
-
-		last = microphone,
+		device_id device;
+		XrDuration prediction_ns;
 	};
-	std::chrono::nanoseconds min_offset;
-	std::chrono::nanoseconds max_offset;
-	std::array<bool, size_t(id::last) + 1> enabled;
+
+	std::vector<sample> pattern;
+	XrDuration motions_to_photons;
+};
+
+struct feature_control
+{
+	enum feature
+	{
+		hid_input,
+		microphone,
+	};
+	feature f;
+	bool state;
 };
 
 struct refresh_rate_change
 {
-	float fps;
+	float hz;
+};
+
+struct stream_tab_change
+{
+	stream_tab tab;
 };
 
 struct application_list
@@ -691,11 +924,24 @@ struct application_icon
 	std::vector<std::byte> image; // In PNG
 };
 
+struct running_applications
+{
+	struct application
+	{
+		std::string name;
+		uint32_t id;
+		bool overlay;
+		bool active;
+	};
+	std::vector<application> applications;
+};
+
 using packets = std::variant<
         crypto_handshake,
         pin_check_2,
         pin_check_4,
         handshake,
+        server_message,
         audio_stream_description,
         video_stream_description,
         audio_data,
@@ -703,8 +949,18 @@ using packets = std::variant<
         haptics,
         timesync_query,
         tracking_control,
+        feature_control,
         refresh_rate_change,
+        stream_tab_change,
         application_list,
-        application_icon>;
+        application_icon,
+        running_applications>;
 } // namespace to_headset
 } // namespace wivrn
+
+template <>
+struct magic_enum::customize::enum_range<wivrn::from_headset::body_part_mask>
+{
+	static constexpr int min = 0;
+	static constexpr int max = static_cast<int>(wivrn::from_headset::body_part_mask::max) - 1;
+};

@@ -19,25 +19,31 @@
 
 #include "lobby.h"
 #include "application.h"
+#include "configuration.h"
 #include "constants.h"
 #include "glm/geometric.hpp"
 #include "hand_model.h"
-#include "hardware.h"
 #include "imgui.h"
 #include "openxr/openxr.h"
 #include "protocol_version.h"
-#include "render/scene_data.h"
+#include "render/animation.h"
+#include "render/scene_components.h"
 #include "stream.h"
+#include "utils/files.h"
+#include "utils/glm_cast.h"
 #include "utils/i18n.h"
 #include "wivrn_client.h"
 #include "wivrn_discover.h"
 #include "wivrn_sockets.h"
 #include "xr/passthrough.h"
 #include "xr/space.h"
-#include <glm/gtc/matrix_access.hpp>
 
-#include <chrono> // IWYU pragma: keep
+#include <chrono>
+#include <filesystem>
 #include <fstream>
+#include <glm/ext.hpp>
+#include <glm/ext/matrix_transform.hpp>
+#include <glm/gtc/matrix_access.hpp>
 #include <glm/gtc/quaternion.hpp>
 #include <glm/matrix.hpp>
 #include <magic_enum.hpp>
@@ -52,6 +58,15 @@
 #include <netdb.h>
 #include <sys/socket.h>
 #include <sys/types.h>
+
+#include "wivrn_config.h"
+#if WIVRN_FEATURE_RENDERDOC
+#include "vk/renderdoc.h"
+#endif
+
+#ifdef __ANDROID__
+#include "android/usb.h"
+#endif
 
 using namespace std::chrono_literals;
 
@@ -73,44 +88,63 @@ static const std::array supported_depth_formats{
         vk::Format::eX8D24UnormPack32,
 };
 
+static float interpolate(float x, std::span<const std::pair<float, float>> arr)
+{
+	assert(arr.size() >= 1);
+
+	if (x <= arr[0].first)
+		return arr[0].second;
+
+	if (x >= arr.back().first)
+		return arr.back().second;
+
+	for (size_t i = 0; i + 1 < arr.size(); i++)
+	{
+		assert(arr[i].first <= arr[i + 1].first);
+		if (arr[i].first <= x and x < arr[i + 1].first)
+		{
+			auto t = (x - arr[i].first) / (arr[i + 1].first - arr[i].first);
+			return std::lerp(arr[i].second, arr[i + 1].second, t);
+		}
+	}
+
+	return arr[0].second; // Should never happen
+}
+
 static glm::quat compute_gui_orientation(glm::vec3 head_position, glm::vec3 new_gui_position)
 {
-	using constants::lobby::gui_pitch;
-
 	glm::vec3 gui_direction = new_gui_position - head_position;
 
 	float gui_yaw = atan2(gui_direction.x, gui_direction.z) + M_PI;
+
+	float eye_gaze_elevation = atan2(gui_direction.y, glm::length(glm::vec2(gui_direction.x, gui_direction.z)));
+	float gui_pitch = interpolate(eye_gaze_elevation * 180 / M_PI, constants::lobby::gui_pitches) * M_PI / 180;
 
 	return glm::quat(cos(gui_yaw / 2), 0, sin(gui_yaw / 2), 0) * glm::quat(cos(gui_pitch / 2), sin(gui_pitch / 2), 0, 0);
 }
 
 void scenes::lobby::move_gui(glm::vec3 head_position, glm::vec3 new_gui_position)
 {
+	using constants::gui::popup_position;
 	using constants::lobby::keyboard_pitch;
 	using constants::lobby::keyboard_position;
-	using constants::lobby::popup_position;
 
 	auto q = compute_gui_orientation(head_position, new_gui_position);
-	auto M = glm::mat3_cast(q); // plane-to-world transform
 
 	// Main window
 	imgui_ctx->layers()[0].position = new_gui_position;
 	imgui_ctx->layers()[0].orientation = q;
 
-	// Popup
-	imgui_ctx->layers()[1].position = new_gui_position + M * popup_position;
-	imgui_ctx->layers()[1].orientation = q;
-
-	// Keyboard
-	imgui_ctx->layers()[2].position = new_gui_position + M * keyboard_position;
-	imgui_ctx->layers()[2].orientation = q * glm::quat(cos(keyboard_pitch / 2), sin(keyboard_pitch / 2), 0, 0);
+	// Popup and keyboard track the main window
+	imgui_ctx->place_layer_relative(1, 0, popup_position);
+	imgui_ctx->place_layer_relative(2, 0, keyboard_position, glm::quat(cos(keyboard_pitch / 2), sin(keyboard_pitch / 2), 0, 0));
 }
 
 scenes::lobby::lobby() :
         scene_impl<lobby>(supported_color_formats, supported_depth_formats)
 {
 	spdlog::info("Using formats {} and {}", vk::to_string(swapchain_format), vk::to_string(depth_format));
-	// composition_layer_depth_test_supported = false;
+
 	if (composition_layer_depth_test_supported)
 		spdlog::info("Composition layer depth test supported");
 	else
@@ -134,6 +168,8 @@ scenes::lobby::lobby() :
 	}
 
 	keyboard.set_layout(config.virtual_keyboard_layout);
+
+	apply_theme_settings();
 
 	if (config.first_run)
 		current_tab = tab::first_run;
@@ -164,6 +200,16 @@ static std::string ip_address_to_string(const in6_addr & addr)
 	char buf[100];
 	inet_ntop(AF_INET6, &addr, buf, sizeof(buf));
 	return buf;
+}
+
+static std::string ip_address_to_string(const sockaddr_in & addr)
+{
+	return ip_address_to_string(addr.sin_addr);
+}
+
+static std::string ip_address_to_string(const sockaddr_in6 & addr)
+{
+	return ip_address_to_string(addr.sin6_addr);
 }
 
 std::unique_ptr<wivrn_session> scenes::lobby::connect_to_session(wivrn_discover::service service, bool manual_connection)
@@ -207,12 +253,18 @@ std::unique_ptr<wivrn_session> scenes::lobby::connect_to_session(wivrn_discover:
 		{
 			switch (i->ai_family)
 			{
-				case AF_INET:
-					service.addresses.push_back(((sockaddr_in *)i->ai_addr)->sin_addr);
-					break;
-				case AF_INET6:
-					service.addresses.push_back(((sockaddr_in6 *)i->ai_addr)->sin6_addr);
-					break;
+				case AF_INET: {
+					auto addr = (sockaddr_in *)i->ai_addr;
+					addr->sin_port = htons(service.port);
+					service.addresses.push_back({.address = *addr});
+				}
+				break;
+				case AF_INET6: {
+					auto addr = (sockaddr_in6 *)i->ai_addr;
+					addr->sin6_port = htons(service.port);
+					service.addresses.push_back({.address = *addr});
+				}
+				break;
 			}
 		}
 
@@ -220,22 +272,22 @@ std::unique_ptr<wivrn_session> scenes::lobby::connect_to_session(wivrn_discover:
 	}
 
 	std::string error;
-	for (const std::variant<in_addr, in6_addr> & address: service.addresses)
+	for (const auto & entry: service.addresses)
 	{
-		std::string address_string = std::visit([](auto & address) {
+		std::string address_string = std::visit([](const auto & address) {
 			return ip_address_to_string(address);
 		},
-		                                        address);
+		                                        entry.address);
 
 		struct connection_cancelled
 		{};
 
 		try
 		{
-			spdlog::debug("Connection to {}", address_string);
+			spdlog::info("Connection to {}", address_string);
 
 			return std::visit([this, &service](auto & address) {
-				return std::make_unique<wivrn_session>(address, service.port, service.tcp_only, keypair, [&](int fd) {
+				return std::make_unique<wivrn_session>(address, service.tcp_only, keypair, [&](int fd) {
 					auto request = pin_request.lock();
 					request->pin_requested = true;
 					request->pin_cancelled = false;
@@ -277,7 +329,7 @@ std::unique_ptr<wivrn_session> scenes::lobby::connect_to_session(wivrn_discover:
 					return request->pin;
 				});
 			},
-			                  address);
+			                  entry.address);
 		}
 		catch (connection_cancelled)
 		{
@@ -305,13 +357,13 @@ std::unique_ptr<wivrn_session> scenes::lobby::connect_to_session(wivrn_discover:
 
 void scenes::lobby::update_server_list()
 {
-	if (application::is_focused() && !discover)
-		discover.emplace();
-	else if (!application::is_focused() && discover)
-		discover.reset();
-
-	if (!discover)
+	if (not discover)
 		return;
+
+#ifdef __ANDROID__
+	if (usb_link_properties_changed())
+		discover.emplace();
+#endif
 
 	std::vector<wivrn_discover::service> discovered_services = discover->get_services();
 
@@ -383,27 +435,59 @@ void scenes::lobby::connect(const configuration::server_data & data)
 	        data.manual);
 }
 
-std::optional<glm::vec3> scenes::lobby::check_recenter_gesture(xr::spaces space, const std::optional<std::array<xr::hand_tracker::joint, XR_HAND_JOINT_COUNT_EXT>> & joints)
+std::optional<glm::vec3> scenes::lobby::check_recenter_gesture(
+        xr::spaces space,
+        const std::optional<std::array<xr::hand_tracker::joint, XR_HAND_JOINT_COUNT_EXT>> & joints,
+        const std::pair<glm::vec3, glm::quat> & head_pose)
 {
 	if (recentering_context and std::get<0>(*recentering_context) != space)
 		return std::nullopt;
 
-	if (not joints)
+	if (joints)
 	{
-		recentering_context.reset();
-		return std::nullopt;
-	}
+		const auto & palm = (*joints)[XR_HAND_JOINT_PALM_EXT].first;
+		const auto palm_y = glm::rotate(glm_cast(palm.pose.orientation), glm::vec3(0, 1, 0));
 
-	const auto & palm = (*joints)[XR_HAND_JOINT_PALM_EXT].first;
-	const auto & o = palm.pose.orientation;
-	const auto & p = palm.pose.position;
-	glm::quat q{o.w, o.x, o.y, o.z};
-	glm::vec3 v{p.x, p.y, p.z};
+		for (XrHandJointEXT index: {
+		             XR_HAND_JOINT_INDEX_PROXIMAL_EXT,
+		             XR_HAND_JOINT_INDEX_INTERMEDIATE_EXT,
+		             XR_HAND_JOINT_INDEX_DISTAL_EXT,
 
-	if (glm::dot(q * glm::vec3(0, 1, 0), glm::vec3(0, -1, 0)) > constants::lobby::recenter_cosangle_min)
-	{
-		recentering_context.emplace(space, glm::vec3{}, 0);
-		return v + glm::vec3(0, constants::lobby::recenter_distance_up, 0) + q * glm::vec3(0, 0, -constants::lobby::recenter_distance_front);
+		             XR_HAND_JOINT_MIDDLE_PROXIMAL_EXT,
+		             XR_HAND_JOINT_MIDDLE_INTERMEDIATE_EXT,
+		             XR_HAND_JOINT_MIDDLE_DISTAL_EXT,
+
+		             XR_HAND_JOINT_RING_PROXIMAL_EXT,
+		             XR_HAND_JOINT_RING_INTERMEDIATE_EXT,
+		             XR_HAND_JOINT_RING_DISTAL_EXT,
+
+		             XR_HAND_JOINT_LITTLE_PROXIMAL_EXT,
+		             XR_HAND_JOINT_LITTLE_INTERMEDIATE_EXT,
+		             XR_HAND_JOINT_LITTLE_DISTAL_EXT,
+		     })
+		{
+			const auto fingertip_y = glm::rotate(glm_cast((*joints)[index].first.pose.orientation), glm::vec3(0, 1, 0));
+
+			if (glm::dot(palm_y, fingertip_y) < constants::lobby::recenter_cos_fingertip_angle_max)
+			{
+				recentering_context.reset();
+				return std::nullopt;
+			}
+		}
+
+		const auto q = glm_cast(palm.pose.orientation);
+		const auto x = glm_cast(palm.pose.position);
+
+		// Make the up vector orthogonal to forward
+		const glm::vec3 forward = glm::rotate(head_pose.second, glm::vec3{0, 0, -1});
+		const glm::vec3 up = glm::normalize(glm::vec3{0, 1, 0} - forward * glm::dot(forward, {0, 1, 0}));
+
+		// Y is pointing to the back of the hand
+		if (glm::dot(q * glm::vec3(0, -1, 0), up) > constants::lobby::recenter_cos_palm_angle_min)
+		{
+			recentering_context.emplace(space, glm::vec3{}, 0);
+			return x + glm::rotate(q, glm::vec3{0, -constants::lobby::recenter_distance_up, -constants::lobby::recenter_distance_front});
+		}
 	}
 
 	recentering_context.reset();
@@ -465,12 +549,11 @@ std::optional<glm::vec3> scenes::lobby::check_recenter_action(XrTime predicted_d
 	{
 		// First frame of recentering
 		imgui_context::controller_state state{
-		        .active = true,
 		        .aim_position = aim->first,
 		        .aim_orientation = aim->second,
 		};
 
-		imgui_ctx->compute_pointer_position(state);
+		state.pointer_position = imgui_ctx->compute_pointer_position(state).first;
 
 		if (state.pointer_position) // TODO: check that the pointer is inside an imgui window
 		{
@@ -515,14 +598,21 @@ std::optional<glm::vec3> scenes::lobby::check_recenter_action(XrTime predicted_d
 		// One step is usually enough, the solution will continuously improve in the next frames
 		glm::vec3 gui_position = imgui_ctx->layers()[0].position;
 		float eps = 0.01;
-		glm::vec3 obj = f(gui_position);
-		glm::vec3 obj_dx = (f(gui_position + glm::vec3(eps, 0, 0)) - obj) / eps;
-		glm::vec3 obj_dy = (f(gui_position + glm::vec3(0, eps, 0)) - obj) / eps;
-		glm::vec3 obj_dz = (f(gui_position + glm::vec3(0, 0, eps)) - obj) / eps;
 
-		glm::mat3 jacobian{obj_dx, obj_dy, obj_dz};
+		glm::vec3 obj;
+		int n_iter = 0;
+		do
+		{
+			obj = f(gui_position);
+			glm::vec3 obj_dx = (f(gui_position + glm::vec3(eps, 0, 0)) - obj) / eps;
+			glm::vec3 obj_dy = (f(gui_position + glm::vec3(0, eps, 0)) - obj) / eps;
+			glm::vec3 obj_dz = (f(gui_position + glm::vec3(0, 0, eps)) - obj) / eps;
 
-		gui_position -= glm::inverse(jacobian) * obj;
+			glm::mat3 jacobian{obj_dx, obj_dy, obj_dz};
+
+			gui_position -= 0.01 * glm::inverse(jacobian) * obj;
+			n_iter++;
+		} while (glm::length(obj) > 0.0001 and n_iter < 1000);
 
 		return gui_position;
 	}
@@ -543,25 +633,238 @@ std::optional<glm::vec3> scenes::lobby::check_recenter_gui(glm::vec3 head_positi
 	return std::nullopt;
 }
 
-// Return the vector v such that dot(v, x) > 0 iff x is on the side where the composition layer is visible
-static glm::vec4 compute_ray_limits(const XrPosef & pose, float margin = 0)
+static void stick_finger_to_gui(std::array<xr::hand_tracker::joint, XR_HAND_JOINT_COUNT_EXT> & hand, const std::vector<imgui_context::window_viewport> & layers)
 {
-	glm::quat q{
-	        pose.orientation.w,
-	        pose.orientation.x,
-	        pose.orientation.y,
-	        pose.orientation.z,
+	// Move XR_HAND_JOINT_INDEX_{TIP,DISTAL,INTERMEDIATE,PROXIMAL}_EXT so that:
+	// - Only the X rotation changes for distal and intermediate (relative to the parent bone)
+	// - Only the X and Y rotation change for the proximal
+	// - The orientation of the tip is the same as the distal
+	// - The position stays constant in the frame of the parent bone
+	// - The position of the tip is on the closest imgui window (considering the tip radius)
+	// - The rotation on X for the index proximal is limited to [-90, +30]
+	// - The rotation on Y for the index proximal is limited to [-30, +30]
+	// - The rotation on X for the index intermediate are equal and limited to [-90, 0]
+
+	// Convert from OpenXR types to glm
+	glm::vec3 tip_x{
+	        hand[XR_HAND_JOINT_INDEX_TIP_EXT].first.pose.position.x,
+	        hand[XR_HAND_JOINT_INDEX_TIP_EXT].first.pose.position.y,
+	        hand[XR_HAND_JOINT_INDEX_TIP_EXT].first.pose.position.z};
+
+	// Compute the target position of the tip
+	std::vector<std::pair<glm::vec3, float>> intersections; // Target position of the finger tip, distance to the GUI plane
+	for (const imgui_context::window_viewport & layer: layers)
+	{
+		// Ignore layers that are not absolutely positionned
+		if (layer.space != xr::spaces::world)
+			continue;
+
+		// Compute all vectors in the reference frame of the GUI plane
+		// The normal of the GUI plane is +Z, the tip points toward -Z
+		auto M = glm::mat3_cast(layer.orientation); // plane-to-world transform
+		glm::vec3 ray_start = glm::transpose(M) * (tip_x - layer.position);
+
+		// Ignore this layer if the tip is outside the limits
+		if (std::abs(ray_start.x) > layer.size.x / 2)
+			continue;
+
+		if (std::abs(ray_start.y) > layer.size.y / 2)
+			continue;
+
+		float distance = ray_start.z; // Positive when the point is in front of the plane
+
+		// Not near the plane: ignore
+		if (distance > 0 or distance < constants::gui::fingertip_distance_stick_thd)
+			continue;
+
+		glm::vec3 target_position = tip_x + M * glm::vec3{0, 0, -distance};
+
+		intersections.emplace_back(target_position, std::abs(distance));
+	}
+
+	if (intersections.empty())
+		return;
+
+	auto [target_position, distance] = *std::ranges::min_element(intersections, {}, &std::pair<glm::vec3, float>::second);
+
+	// Convert from OpenXR to glm
+	glm::vec3 distal_x{
+	        hand[XR_HAND_JOINT_INDEX_DISTAL_EXT].first.pose.position.x,
+	        hand[XR_HAND_JOINT_INDEX_DISTAL_EXT].first.pose.position.y,
+	        hand[XR_HAND_JOINT_INDEX_DISTAL_EXT].first.pose.position.z};
+	glm::vec3 intermediate_x{
+	        hand[XR_HAND_JOINT_INDEX_INTERMEDIATE_EXT].first.pose.position.x,
+	        hand[XR_HAND_JOINT_INDEX_INTERMEDIATE_EXT].first.pose.position.y,
+	        hand[XR_HAND_JOINT_INDEX_INTERMEDIATE_EXT].first.pose.position.z};
+	glm::vec3 proximal_x{
+	        hand[XR_HAND_JOINT_INDEX_PROXIMAL_EXT].first.pose.position.x,
+	        hand[XR_HAND_JOINT_INDEX_PROXIMAL_EXT].first.pose.position.y,
+	        hand[XR_HAND_JOINT_INDEX_PROXIMAL_EXT].first.pose.position.z};
+	glm::vec3 metacarpal_x{
+	        hand[XR_HAND_JOINT_INDEX_METACARPAL_EXT].first.pose.position.x,
+	        hand[XR_HAND_JOINT_INDEX_METACARPAL_EXT].first.pose.position.y,
+	        hand[XR_HAND_JOINT_INDEX_METACARPAL_EXT].first.pose.position.z};
+	glm::quat distal_q = glm::quat::wxyz(
+	        hand[XR_HAND_JOINT_INDEX_DISTAL_EXT].first.pose.orientation.w,
+	        hand[XR_HAND_JOINT_INDEX_DISTAL_EXT].first.pose.orientation.x,
+	        hand[XR_HAND_JOINT_INDEX_DISTAL_EXT].first.pose.orientation.y,
+	        hand[XR_HAND_JOINT_INDEX_DISTAL_EXT].first.pose.orientation.z);
+	glm::quat intermediate_q = glm::quat::wxyz(
+	        hand[XR_HAND_JOINT_INDEX_INTERMEDIATE_EXT].first.pose.orientation.w,
+	        hand[XR_HAND_JOINT_INDEX_INTERMEDIATE_EXT].first.pose.orientation.x,
+	        hand[XR_HAND_JOINT_INDEX_INTERMEDIATE_EXT].first.pose.orientation.y,
+	        hand[XR_HAND_JOINT_INDEX_INTERMEDIATE_EXT].first.pose.orientation.z);
+	glm::quat proximal_q = glm::quat::wxyz(
+	        hand[XR_HAND_JOINT_INDEX_PROXIMAL_EXT].first.pose.orientation.w,
+	        hand[XR_HAND_JOINT_INDEX_PROXIMAL_EXT].first.pose.orientation.x,
+	        hand[XR_HAND_JOINT_INDEX_PROXIMAL_EXT].first.pose.orientation.y,
+	        hand[XR_HAND_JOINT_INDEX_PROXIMAL_EXT].first.pose.orientation.z);
+	glm::quat metacarpal_q = glm::quat::wxyz(
+	        hand[XR_HAND_JOINT_INDEX_METACARPAL_EXT].first.pose.orientation.w,
+	        hand[XR_HAND_JOINT_INDEX_METACARPAL_EXT].first.pose.orientation.x,
+	        hand[XR_HAND_JOINT_INDEX_METACARPAL_EXT].first.pose.orientation.y,
+	        hand[XR_HAND_JOINT_INDEX_METACARPAL_EXT].first.pose.orientation.z);
+
+	// Get relative positions and orientations
+	const auto rel_tip_x = glm::rotate(glm::conjugate(distal_q), tip_x - distal_x);
+	// relative tip orientation is always identity
+
+	const auto rel_distal_x = glm::rotate(glm::conjugate(intermediate_q), distal_x - intermediate_x);
+	const auto rel_distal_q = glm::conjugate(intermediate_q) * distal_q;
+	const auto rel_distal_θ = glm::eulerAngles(rel_distal_q);
+
+	const auto rel_intermediate_x = glm::rotate(glm::conjugate(proximal_q), intermediate_x - proximal_x);
+	const auto rel_intermediate_q = glm::conjugate(proximal_q) * intermediate_q;
+	const auto rel_intermediate_θ = glm::eulerAngles(rel_intermediate_q);
+
+	const auto rel_proximal_x = glm::rotate(glm::conjugate(metacarpal_q), proximal_x - metacarpal_x);
+	const auto rel_proximal_q = glm::conjugate(metacarpal_q) * proximal_q;
+	const auto rel_proximal_θ = glm::eulerAngles(rel_proximal_q);
+
+	// Forward kinematics
+	auto f = [&](float proximal_θx, float proximal_θy, float intermediate_θx, float distal_θx) -> glm::vec3 {
+		// Compute the absolute tip position
+		const glm::quat new_rel_proximal_q = glm::quat(glm::vec3(proximal_θx, proximal_θy, rel_proximal_θ.z));
+		const glm::quat new_rel_intermediate_q = glm::quat(glm::vec3(intermediate_θx, rel_intermediate_θ.y, rel_intermediate_θ.z));
+		const glm::quat new_rel_distal_q = glm::quat(glm::vec3(distal_θx, rel_distal_θ.y, rel_distal_θ.z));
+
+		const glm::quat proximal_q = metacarpal_q * new_rel_proximal_q;
+		const glm::quat intermediate_q = proximal_q * new_rel_intermediate_q;
+		const glm::quat distal_q = intermediate_q * new_rel_distal_q;
+
+		const glm::vec3 tip_x = metacarpal_x +
+		                        glm::rotate(metacarpal_q, rel_proximal_x) +
+		                        glm::rotate(proximal_q, rel_intermediate_x) +
+		                        glm::rotate(intermediate_q, rel_distal_x) +
+		                        glm::rotate(distal_q, rel_tip_x);
+
+		return tip_x - target_position;
 	};
 
-	glm::vec3 p{
-	        pose.position.x,
-	        pose.position.y,
-	        pose.position.z,
+	// Inverse kinematics solver for the tip position
+	float proximal_θx = rel_proximal_θ.x;
+	float proximal_θy = rel_proximal_θ.y;
+	float intermediate_θx = rel_intermediate_θ.x;
+	float distal_θx = rel_distal_θ.x;
+
+	glm::vec3 objective = f(proximal_θx, proximal_θy, intermediate_θx, distal_θx);
+	float eps = 0.01; // 10 milliradian ~ 0.57 deg
+	int n = 0;
+
+	while (glm::length(objective) > 1e-4 and n++ < 1000)
+	{
+		glm::vec3 dobj_1 = (f(proximal_θx + eps, proximal_θy, intermediate_θx, distal_θx) - objective) / eps;
+		glm::vec3 dobj_2 = (f(proximal_θx, proximal_θy + eps, intermediate_θx, distal_θx) - objective) / eps;
+		glm::vec3 dobj_3 = (f(proximal_θx, proximal_θy, intermediate_θx + eps, distal_θx) - objective) / eps;
+		glm::vec3 dobj_4 = (f(proximal_θx, proximal_θy, intermediate_θx, distal_θx + eps) - objective) / eps;
+
+		glm::mat4x3 jacobian(dobj_1, dobj_2, dobj_3, dobj_4);
+		glm::mat3x4 jacobian_transpose = glm::transpose(jacobian);
+
+		glm::vec4 direction = -glm::normalize(jacobian_transpose * objective);
+		glm::vec4 delta = 10 * direction * glm::length(objective);
+
+		float tmp = (delta.z + delta.w) / 2;
+		delta.z = delta.w = tmp;
+
+		proximal_θx = std::clamp<float>(proximal_θx + delta.x, -M_PI / 2, M_PI / 6);
+		proximal_θy = std::clamp<float>(proximal_θy + delta.y, -M_PI / 6, M_PI / 6);
+		intermediate_θx = std::clamp<float>(intermediate_θx + delta.z, -M_PI / 2, 0);
+		distal_θx = std::clamp<float>(distal_θx + delta.w, -M_PI / 2, 0);
+
+		objective = f(proximal_θx, proximal_θy, intermediate_θx, distal_θx);
+	}
+
+	// Fill in the modified bones
+	const glm::vec3 new_rel_proximal_θ(proximal_θx, proximal_θy, rel_proximal_θ.z);
+	const glm::vec3 new_rel_intermediate_θ(intermediate_θx, rel_intermediate_θ.y, rel_intermediate_θ.z);
+	const glm::vec3 new_rel_distal_θ(distal_θx, rel_distal_θ.y, rel_distal_θ.z);
+
+	const glm::quat new_rel_proximal_q = glm::quat(new_rel_proximal_θ);
+	const glm::quat new_rel_intermediate_q = glm::quat(new_rel_intermediate_θ);
+	const glm::quat new_rel_distal_q = glm::quat(new_rel_distal_θ);
+
+	proximal_q = metacarpal_q * new_rel_proximal_q;
+	intermediate_q = proximal_q * new_rel_intermediate_q;
+	distal_q = intermediate_q * new_rel_distal_q;
+
+	intermediate_x = proximal_x + glm::rotate(proximal_q, rel_intermediate_x);
+	distal_x = intermediate_x + glm::rotate(intermediate_q, rel_distal_x);
+	tip_x = distal_x + glm::rotate(distal_q, rel_tip_x);
+
+	hand[XR_HAND_JOINT_INDEX_PROXIMAL_EXT].first.pose.orientation = {
+	        proximal_q.x,
+	        proximal_q.y,
+	        proximal_q.z,
+	        proximal_q.w,
+	};
+	hand[XR_HAND_JOINT_INDEX_INTERMEDIATE_EXT].first.pose = {
+	        .orientation = {
+	                intermediate_q.x,
+	                intermediate_q.y,
+	                intermediate_q.z,
+	                intermediate_q.w,
+	        },
+	        .position = {
+	                intermediate_x.x,
+	                intermediate_x.y,
+	                intermediate_x.z,
+	        },
+	};
+	hand[XR_HAND_JOINT_INDEX_DISTAL_EXT].first.pose = {
+	        .orientation = {
+	                distal_q.x,
+	                distal_q.y,
+	                distal_q.z,
+	                distal_q.w,
+	        },
+	        .position = {
+	                distal_x.x,
+	                distal_x.y,
+	                distal_x.z,
+	        },
+	};
+	hand[XR_HAND_JOINT_INDEX_TIP_EXT].first.pose = {
+	        .orientation = {
+	                distal_q.x,
+	                distal_q.y,
+	                distal_q.z,
+	                distal_q.w,
+	        },
+	        .position = {
+	                tip_x.x,
+	                tip_x.y,
+	                tip_x.z,
+	        },
 	};
 
-	glm::vec3 normal = glm::column(glm::mat3_cast(q), 2);
-
-	return glm::vec4(normal, -glm::dot(p, normal) - margin);
+	// Translate the whole hand if we cannot find an exact solution
+	for (auto & hand_joint: hand)
+	{
+		hand_joint.first.pose.position.x -= objective.x;
+		hand_joint.first.pose.position.y -= objective.y;
+		hand_joint.first.pose.position.z -= objective.z;
+	}
 }
 
 void scenes::lobby::render(const XrFrameState & frame_state)
@@ -572,7 +875,7 @@ void scenes::lobby::render(const XrFrameState & frame_state)
 		{
 			auto session = async_session.get();
 			if (session)
-				next_scene = stream::create(std::move(session), 1'000'000'000.f / frame_state.predictedDisplayPeriod);
+				next_scene = stream::create(std::move(session), 1'000'000'000.f / frame_state.predictedDisplayPeriod, server_name, *this);
 
 			async_session.reset();
 		}
@@ -586,12 +889,20 @@ void scenes::lobby::render(const XrFrameState & frame_state)
 
 	if (next_scene)
 	{
-		if (!next_scene->alive())
-			next_scene.reset();
-		else if (next_scene->current_state() == scenes::stream::state::streaming)
+		server_hid_forwarding = next_scene->hid_forwarding_enabled();
+
+		switch (next_scene->current_state())
 		{
-			autoconnect_enabled = true;
-			application::push_scene(next_scene);
+			case scenes::stream::state::streaming:
+				application::push_scene(next_scene);
+				break;
+
+			case scenes::stream::state::shutdown:
+				current_tab = tab::server_list;
+				break;
+
+			default:
+				break;
 		}
 	}
 
@@ -631,6 +942,11 @@ void scenes::lobby::render(const XrFrameState & frame_state)
 	}
 
 	session.begin_frame();
+	renderer->debug_draw_clear();
+
+#if WIVRN_FEATURE_RENDERDOC
+	renderdoc_begin(*vk_instance);
+#endif
 
 	XrSpace world_space = application::space(xr::spaces::world);
 	auto [flags, views] = session.locate_views(viewconfig, frame_state.predictedDisplayTime, world_space);
@@ -651,25 +967,32 @@ void scenes::lobby::render(const XrFrameState & frame_state)
 
 	if (left_hand and right_hand)
 	{
+		auto windows = imgui_ctx->windows();
+
 		auto left = left_hand->locate(world_space, frame_state.predictedDisplayTime);
+		if (left)
+		{
+			stick_finger_to_gui(*left, windows);
+			hide_left_controller = true;
+		}
+
 		auto right = right_hand->locate(world_space, frame_state.predictedDisplayTime);
+		if (right)
+		{
+			stick_finger_to_gui(*right, windows);
+			hide_right_controller = true;
+		}
 
 		hand_model::apply(world, left, right);
 
-		if (left and xr::hand_tracker::check_flags(*left, XR_SPACE_LOCATION_POSITION_TRACKED_BIT | XR_SPACE_LOCATION_POSITION_VALID_BIT, 0))
-			hide_left_controller = true;
+		if (not new_gui_position and head_position)
+			new_gui_position = check_recenter_gesture(xr::spaces::palm_left, left, *head_position);
 
-		if (right and xr::hand_tracker::check_flags(*right, XR_SPACE_LOCATION_POSITION_TRACKED_BIT | XR_SPACE_LOCATION_POSITION_VALID_BIT, 0))
-			hide_right_controller = true;
-
-		if (not new_gui_position)
-			new_gui_position = check_recenter_gesture(xr::spaces::palm_left, left);
-
-		if (not new_gui_position)
-			new_gui_position = check_recenter_gesture(xr::spaces::palm_right, right);
+		if (not new_gui_position and head_position)
+			new_gui_position = check_recenter_gesture(xr::spaces::palm_right, right, *head_position);
 	}
 
-	if (head_position && new_gui_position)
+	if (head_position and new_gui_position)
 	{
 		move_gui(head_position->first, *new_gui_position);
 	}
@@ -715,17 +1038,36 @@ void scenes::lobby::render(const XrFrameState & frame_state)
 
 	std::vector<std::pair<int, XrCompositionLayerQuad>> imgui_layers = draw_gui(frame_state.predictedDisplayTime);
 
-	// Get the planes that limit the ray size from the composition layers
-	std::vector<glm::vec4> ray_limits;
-	for (auto & [z_index, layer]: imgui_layers)
+#if WIVRN_CLIENT_DEBUG_MENU
+	if (auto * node = world.try_get<components::node>(debug_primitive_to_highlight.first);
+	    node and
+	    node->mesh and
+	    debug_primitive_to_highlight.second < node->mesh->primitives.size())
 	{
-		if (z_index != constants::lobby::zindex_recenter_tip)
-			ray_limits.push_back(compute_ray_limits(layer.pose));
+		const auto & primitive = node->mesh->primitives[debug_primitive_to_highlight.second];
+		// FIXME: transform_to_root is 1 frame late
+		renderer->debug_draw_box(node->transform_to_root, primitive.obb_min, primitive.obb_max, glm::vec4(1, 1, 1, 1));
+	}
+#endif
+
+	// Get the planes that limit the ray size from the composition layers
+	std::vector<glm::mat4> world_to_window;
+	for (auto & window: imgui_ctx->windows())
+	{
+		if (window.space == xr::spaces::world)
+			world_to_window.push_back(glm::inverse(glm::translate(window.position) * glm::mat4(glm::mat3_cast(window.orientation)) * glm::scale(glm::vec3(window.size, 1))));
 	}
 
-	input->apply(world, world_space, frame_state.predictedDisplayTime, hide_left_controller, hide_right_controller, ray_limits);
+	input->apply(world,
+	             world_space,
+	             frame_state.predictedDisplayTime,
+	             hide_left_controller,
+	             not imgui_ctx->is_aim_interaction()[0],
+	             hide_right_controller,
+	             not imgui_ctx->is_aim_interaction()[1],
+	             world_to_window);
 
-	assert(renderer);
+	renderer::animate(world, frame_state.predictedDisplayPeriod * 1.0e-9);
 
 	world.get<components::node>(lobby_entity).visible = not application::get_config().passthrough_enabled;
 
@@ -740,25 +1082,20 @@ void scenes::lobby::render(const XrFrameState & frame_state)
 	        height,
 	        composition_layer_depth_test_supported,
 	        composition_layer_depth_test_supported ? layer_lobby | layer_controllers : layer_lobby,
-	        clear_color);
+	        clear_color,
+	        true);
 
 	if (composition_layer_depth_test_supported)
 		set_depth_test(true, XR_COMPARE_OP_ALWAYS_FB);
 
-	bool dim_gui = imgui_ctx->is_modal_popup_shown() and composition_layer_color_scale_bias_supported;
 	for (auto & [z_index, layer]: imgui_layers)
 	{
 		if (z_index < constants::lobby::zindex_recenter_tip)
 		{
 			add_quad_layer(layer.layerFlags, layer.space, layer.eyeVisibility, layer.subImage, layer.pose, layer.size);
 
-			if (dim_gui)
-				set_color_scale_bias(constants::lobby::dimming_scale, constants::lobby::dimming_bias);
-
 			if (composition_layer_depth_test_supported)
 				set_depth_test(true, XR_COMPARE_OP_LESS_OR_EQUAL_FB);
-
-			dim_gui = false; // Only dim the main window
 		}
 	}
 
@@ -782,6 +1119,10 @@ void scenes::lobby::render(const XrFrameState & frame_state)
 	}
 
 	render_end();
+
+#if WIVRN_FEATURE_RENDERDOC
+	renderdoc_end(*vk_instance);
+#endif
 }
 
 void scenes::lobby::on_focused()
@@ -790,30 +1131,41 @@ void scenes::lobby::on_focused()
 
 	auto views = system.view_configuration_views(viewconfig);
 	assert(views.size() == 2); // FIXME
-	stream_view = override_view(views[0], guess_model());
+	stream_view = application::get_hmd_traits().override_view(views[0]);
 	width = views[0].recommendedImageRectWidth;
 	height = views[0].recommendedImageRectHeight;
 
 	// assert(std::ranges::all_of(views, [width](const XrViewConfigurationView & view) { return view.recommendedImageRectWidth == width; }));
 	// assert(std::ranges::all_of(views, [height](const XrViewConfigurationView & view) { return view.recommendedImageRectHeight == height; }));
 
-	renderer.emplace(device, physical_device, queue, commandpool);
-	loader.emplace(device, physical_device, queue, queue_family_index, renderer->get_default_material());
+	auto & config = application::get_config();
 
-	lobby_entity = load_gltf("ground.gltf", layer_lobby).first;
+	try
+	{
+		lobby_entity = add_gltf(config.environment_model, layer_lobby).first;
+	}
+	catch (std::exception & e)
+	{
+		spdlog::warn("Cannot load environment from {}: {}, reverting to default", config.environment_model, e.what());
+		config.environment_model = application::get_default_config().environment_model;
+		lobby_entity = add_gltf(config.environment_model, layer_lobby).first;
+		config.save();
+	}
 
-	std::string profile = controller_name();
+	const auto & profile = application::get_hmd_traits().controller_profile;
 	input.emplace(
 	        *this,
-	        "controllers/" + profile + "/profile.json",
+	        "assets://controllers/" + profile + "/profile.json",
 	        layer_controllers,
-	        layer_rays);
+	        layer_rays,
+	        get_action("left_trigger").first,
+	        get_action("right_trigger").first);
 
 	spdlog::info("Loaded input profile {}", input->id);
 
 	for (auto i: {xr::spaces::aim_left, xr::spaces::aim_right, xr::spaces::grip_left, xr::spaces::grip_right})
 	{
-		auto [p, q] = input->offset[i] = controller_offset(controller_name(), i);
+		auto [p, q] = input->offset[i] = application::get_hmd_traits().controller_offset(i);
 
 		auto rot = glm::degrees(glm::eulerAngles(q));
 		spdlog::info("Initializing offset of space {} to ({}, {}, {}) mm, ({}, {}, {})°",
@@ -831,12 +1183,37 @@ void scenes::lobby::on_focused()
 	offset_orientation = glm::degrees(glm::eulerAngles(input->offset[xr::spaces::grip_left].second));
 	ray_offset = input->offset[xr::spaces::aim_left].first.z;
 
-	xyz_axes_left_controller = load_gltf("xyz-arrows.glb", layer_controllers).first;
-	xyz_axes_right_controller = load_gltf("xyz-arrows.glb", layer_controllers).first;
+	xyz_axes_left_controller = add_gltf("assets://xyz-arrows.glb", layer_controllers).first;
+	xyz_axes_right_controller = add_gltf("assets://xyz-arrows.glb", layer_controllers).first;
 #endif
 
 	recenter_left_action = get_action("recenter_left").first;
 	recenter_right_action = get_action("recenter_right").first;
+
+	if (system.hand_tracking_supported())
+	{
+		left_hand = session.create_hand_tracker(XR_HAND_LEFT_EXT);
+		right_hand = session.create_hand_tracker(XR_HAND_RIGHT_EXT);
+
+		bool using_hand_mesh_fb = false;
+		if (system.hand_mesh_fb_supported())
+		{
+			const auto * left_hand_mesh_fb = left_hand->mesh();
+			const auto * right_hand_mesh_fb = right_hand->mesh();
+			if (left_hand_mesh_fb and right_hand_mesh_fb)
+			{
+				hand_model::add_hand(*this, XR_HAND_LEFT_EXT, *left_hand_mesh_fb, layer_controllers);
+				hand_model::add_hand(*this, XR_HAND_RIGHT_EXT, *right_hand_mesh_fb, layer_controllers);
+				using_hand_mesh_fb = true;
+			}
+		}
+
+		if (!using_hand_mesh_fb)
+		{
+			hand_model::add_hand(*this, XR_HAND_LEFT_EXT, "assets://left-hand.glb", layer_controllers);
+			hand_model::add_hand(*this, XR_HAND_RIGHT_EXT, "assets://right-hand.glb", layer_controllers);
+		}
+	}
 
 	std::vector imgui_inputs{
 	        imgui_context::controller{
@@ -846,6 +1223,7 @@ void scenes::lobby::on_focused()
 	                .squeeze = get_action("left_squeeze").first,
 	                .scroll = get_action("left_scroll").first,
 	                .haptic_output = get_action("left_haptic").first,
+	                .hand = left_hand ? &*left_hand : nullptr,
 	        },
 	        imgui_context::controller{
 	                .aim = get_action_space("right_aim"),
@@ -854,20 +1232,9 @@ void scenes::lobby::on_focused()
 	                .squeeze = get_action("right_squeeze").first,
 	                .scroll = get_action("right_scroll").first,
 	                .haptic_output = get_action("right_haptic").first,
+	                .hand = right_hand ? &*right_hand : nullptr,
 	        },
 	};
-
-	if (system.hand_tracking_supported())
-	{
-		left_hand = session.create_hand_tracker(XR_HAND_LEFT_EXT);
-		right_hand = session.create_hand_tracker(XR_HAND_RIGHT_EXT);
-		hand_model::add_hand(*this, XR_HAND_LEFT_EXT, "left-hand.glb", layer_controllers);
-		hand_model::add_hand(*this, XR_HAND_RIGHT_EXT, "right-hand.glb", layer_controllers);
-		imgui_inputs.push_back({.hand = &*left_hand});
-		imgui_inputs.push_back({.hand = &*right_hand});
-	}
-
-	face_tracker = xr::make_face_tracker(instance, system, session);
 
 	// 0.4mm / pixel
 	std::vector<imgui_context::viewport> vps{
@@ -882,16 +1249,16 @@ void scenes::lobby::on_focused()
 	        {
 	                // Pop up window
 	                .space = xr::spaces::world,
-	                .size = {0.6, 0.28},
+	                .size = {0.6, 0.4},
 	                .vp_origin = {1500, 0},
-	                .vp_size = {1500, 700},
+	                .vp_size = {1500, 1000},
 	                .z_index = constants::lobby::zindex_gui,
 	        },
 	        {
 	                // Virtual keyboard
 	                .space = xr::spaces::world,
 	                .size = {0.6, 0.2},
-	                .vp_origin = {1500, 700},
+	                .vp_origin = {1500, 1000},
 	                .vp_size = {1500, 500},
 	                .always_show_cursor = true,
 	                .z_index = constants::lobby::zindex_gui,
@@ -905,36 +1272,92 @@ void scenes::lobby::on_focused()
 	                .vp_origin = {0, 1000},
 	                .vp_size = {1500, 300},
 	                .z_index = constants::lobby::zindex_recenter_tip,
-	        }};
+	        },
+	        {
+	                // Tooltip
+	                .space = xr::spaces::world,
+	                .size = {0.6, 0.08},
+	                .vp_origin = {0, 1300},
+	                .vp_size = {1500, 200},
+	                .tooltip_viewport = true,
+	                .z_index = constants::lobby::zindex_tooltip,
+	        },
+	};
 
-	swapchain_imgui = xr::swapchain(session, device, swapchain_format, 3000, 1300);
+	xr::swapchain swapchain_imgui(instance, session, device, swapchain_format, 3000, 1500);
 
-	imgui_ctx.emplace(physical_device, device, queue_family_index, queue, imgui_inputs, swapchain_imgui, vps);
+	imgui_ctx.emplace(
+	        physical_device,
+	        device,
+	        queue_family_index,
+	        queue,
+	        imgui_inputs,
+	        std::move(swapchain_imgui),
+	        vps,
+	        image_cache);
 
 	auto t = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
 	auto tm = std::localtime(&t);
-	std::string image = tm->tm_mon == 5 ? "wivrn-pride" : "wivrn";
-	try
+	switch (tm->tm_mon)
 	{
-		about_picture = imgui_ctx->load_texture(image + ".ktx2");
+		case 5:
+			about_picture = imgui_ctx->load_texture("assets://wivrn-pride.ktx2");
+			break;
+		case 11:
+			about_picture = imgui_ctx->load_texture("assets://wivrn-christmas.ktx2");
+			break;
+		default:
+			about_picture = imgui_ctx->load_texture("assets://wivrn.ktx2");
+			break;
 	}
-	catch (...)
-	{
-		about_picture = imgui_ctx->load_texture(image + ".png");
-	}
+
+	default_environment_screenshot = imgui_ctx->load_texture("assets://default-environment.ktx2");
 
 	try
 	{
-		default_icon = imgui_ctx->load_texture("default_icon.ktx2");
+		local_environments = load_environment_json(utils::read_whole_file<std::string>(application::get_config_path() / "environments.json"));
+
+		// Remove environments if the model file is deleted
+		std::erase_if(local_environments, [&](const environment_model & model) {
+			std::filesystem::path path = model.local_gltf_path;
+			return not std::filesystem::exists(path);
+		});
 	}
 	catch (...)
 	{
-		default_icon = imgui_ctx->load_texture("default_icon.png");
 	}
+
+	local_environments.push_back(
+	        environment_model{
+	                .name = gettext_noop("Passthrough"),
+	                .author = "",
+	                .description = "",
+	                .screenshot_url = "",
+	                .gltf_url = "passthrough", // This needs to be unique because it is used as a key, even if there is no actual URL
+	                .builtin = true,
+	                .override_order = -2,
+	                .local_gltf_path = "",
+	                .screenshot = imgui_ctx->load_texture("assets://passthrough.ktx2")});
+
+	local_environments.push_back(
+	        environment_model{
+	                .name = gettext_noop("Default environment"),
+	                .author = "",
+	                .description = "",
+	                .screenshot_url = "",
+	                .gltf_url = "default",
+	                .builtin = true,
+	                .override_order = -1,
+	                .local_gltf_path = application::get_default_config().environment_model,
+	                .screenshot = imgui_ctx->load_texture("assets://default-environment.ktx2")});
+
+	std::ranges::sort(local_environments, std::less{});
 
 	setup_passthrough();
-	session.set_refresh_rate(application::get_config().preferred_refresh_rate.value_or(0));
-	multicast = application::get_wifi_lock().get_multicast_lock();
+	discover.emplace();
+
+	session.set_performance_level(XR_PERF_SETTINGS_DOMAIN_CPU_EXT, XR_PERF_SETTINGS_LEVEL_SUSTAINED_HIGH_EXT);
+	session.set_performance_level(XR_PERF_SETTINGS_DOMAIN_GPU_EXT, XR_PERF_SETTINGS_LEVEL_SUSTAINED_HIGH_EXT);
 }
 
 void scenes::lobby::setup_passthrough()
@@ -952,21 +1375,16 @@ void scenes::lobby::on_unfocused()
 	renderer->wait_idle(); // Must be before the scene data because the renderer uses its descriptor sets
 
 	about_picture = 0;
-	default_icon = 0;
-	app_icons.clear();
+	default_environment_screenshot = 0;
+	local_environments.clear();
+
 	imgui_ctx.reset();
-	world.clear(); // Must be cleared before the renderer so that the descriptor sets are freed before their pools
+	world = entt::registry{};
 
 	input.reset();
 	left_hand.reset();
 	right_hand.reset();
 	face_tracker.emplace<std::monostate>();
-
-	loader.reset();
-	renderer.reset();
-	clear_swapchains();
-	swapchain_imgui = xr::swapchain();
-	multicast.reset();
 }
 
 void scenes::lobby::on_xr_event(const xr::event & event)
@@ -974,8 +1392,8 @@ void scenes::lobby::on_xr_event(const xr::event & event)
 	switch (event.header.type)
 	{
 		case XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED:
-			if (event.state_changed.state == XR_SESSION_STATE_STOPPING)
-				discover.reset();
+			if (event.state_changed.state == XR_SESSION_STATE_FOCUSED)
+				autoconnect_enabled = true;
 			recenter_gui = true;
 			break;
 		case XR_TYPE_EVENT_DATA_REFERENCE_SPACE_CHANGE_PENDING:
@@ -1018,6 +1436,7 @@ scene::meta & scenes::lobby::get_meta_scene()
 	                                "/interaction_profiles/bytedance/pico_neo3_controller",
 	                                "/interaction_profiles/bytedance/pico4_controller",
 	                                "/interaction_profiles/bytedance/pico4s_controller",
+	                                "/interaction_profiles/yvr/touch_controller_yvr",
 	                                "/interaction_profiles/htc/vive_focus3_controller",
 	                        },
 	                        {
@@ -1047,6 +1466,17 @@ scene::meta & scenes::lobby::get_meta_scene()
 	                                {"right_aim", "/user/hand/right/input/aim/pose"},
 	                                {"right_trigger", "/user/hand/right/input/select/click"},
 	                                {"right_squeeze", "/user/hand/right/input/menu/click"},
+	                        },
+	                },
+	                suggested_binding{
+	                        {
+	                                "/interaction_profiles/ext/hand_interaction_ext",
+	                        },
+	                        {
+	                                {"left_aim", "/user/hand/left/input/aim/pose"},
+	                                {"left_trigger", "/user/hand/left/input/aim_activate_ext"},
+	                                {"right_aim", "/user/hand/right/input/aim/pose"},
+	                                {"right_trigger", "/user/hand/right/input/aim_activate_ext"},
 	                        },
 	                },
 	        }};

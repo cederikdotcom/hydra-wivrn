@@ -20,39 +20,42 @@
 #pragma once
 
 #include "ffmpeg_helper.h"
+#include "utils/gpu_timestamp_pool.h"
 #include "video_encoder_ffmpeg.h"
 
 #include <array>
-#include <chrono>
 #include <vector>
 #include <vulkan/vulkan_raii.hpp>
 
 namespace wivrn
 {
 struct encoder_settings;
-struct wivrn_vk_bundle;
 
 class video_encoder_va : public video_encoder_ffmpeg
 {
+	vk_bundle & vk;
+	vk::raii::CommandPool cmd_pool;
 	struct in_t
 	{
 		av_frame_ptr va_frame;
 		av_frame_ptr drm_frame;
+		vk::raii::Fence fence = nullptr;
+		vk::raii::CommandBuffer cmd = nullptr;
 		vk::raii::Image luma = nullptr;
 		vk::raii::Image chroma = nullptr;
 		std::vector<vk::raii::DeviceMemory> mem;
 	};
 	av_buffer_ptr drm_frame_ctx;
 	std::array<in_t, num_slots> in;
-	vk::Rect2D rect;
-	bool synchronization2 = false;
+
+	gpu_timestamp_pool ts_pool;
 
 public:
-	video_encoder_va(wivrn_vk_bundle &, wivrn::encoder_settings & settings, float fps, uint8_t stream_index);
+	video_encoder_va(wivrn::vk_bundle &, const wivrn::encoder_settings & settings, uint8_t stream_index);
 
-	std::pair<bool, vk::Semaphore> present_image(vk::Image y_cbcr, vk::raii::CommandBuffer & cmd_buf, uint8_t slot, uint64_t frame_index) override;
+	void present_image(vk::Image y_cbcr, vk::SemaphoreSubmitInfo info, uint8_t slot, uint64_t frame_index) override;
 
 protected:
-	void push_frame(bool idr, std::chrono::steady_clock::time_point pts, uint8_t slot) override;
+	void push_frame(bool idr, uint8_t slot) override;
 };
 } // namespace wivrn

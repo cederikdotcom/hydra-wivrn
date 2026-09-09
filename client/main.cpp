@@ -20,6 +20,7 @@
 #include "application.h"
 #include "scenes/lobby.h"
 #include "spdlog/spdlog.h"
+#include "version.h"
 
 #include <arpa/inet.h>
 #include <netdb.h>
@@ -40,6 +41,10 @@ void real_main(android_app * native_app)
 void real_main()
 #endif
 {
+	if (wivrn::is_tag)
+		spdlog::info("Starting WiVRn version {}", wivrn::display_version());
+	else
+		spdlog::info("Starting WiVRn version {} ({})", wivrn::display_version(), wivrn::git_commit);
 	try
 	{
 		application_info info;
@@ -84,7 +89,6 @@ void real_main()
 }
 
 #ifdef __ANDROID__
-void android_main(android_app * native_app) __attribute__((visibility("default")));
 void android_main(android_app * native_app)
 {
 	static auto logger = spdlog::android_logger_mt("WiVRn", "WiVRn");

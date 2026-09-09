@@ -45,13 +45,21 @@ std::filesystem::path xdg_cache_home()
 
 std::filesystem::path xdg_data_home()
 {
-	if (const char * xdg_data_home = std::getenv("XDG_DATA_HOME"))
+	if (const char * xdg_data_home = std::getenv("XDG_DATA_HOME"); xdg_data_home and *xdg_data_home)
 		return xdg_data_home;
 
 	if (const char * home = std::getenv("HOME"))
 		return std::filesystem::path(home) / ".local/share";
 
 	return ".";
+}
+
+std::filesystem::path xdg_runtime_dir()
+{
+	if (const char * xdg_runtime_dir = std::getenv("XDG_RUNTIME_DIR"); xdg_runtime_dir and *xdg_runtime_dir)
+		return xdg_runtime_dir;
+
+	return "/tmp";
 }
 
 std::vector<std::filesystem::path> xdg_config_dirs()
@@ -71,9 +79,11 @@ std::vector<std::filesystem::path> xdg_config_dirs()
 	return paths;
 }
 
-std::vector<std::filesystem::path> xdg_data_dirs()
+std::vector<std::filesystem::path> xdg_data_dirs(bool include_data_home)
 {
 	std::vector<std::filesystem::path> paths;
+	if (include_data_home)
+		paths.push_back(xdg_data_home());
 
 	if (const char * xdg_config_dirs = std::getenv("XDG_DATA_DIRS"))
 	{

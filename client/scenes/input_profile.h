@@ -37,8 +37,16 @@ struct input_profile
 
 	magic_enum::containers::array<xr::spaces, std::pair<glm::vec3, glm::quat>> offset;
 
-	input_profile(scene & scene, const std::filesystem::path & json_profile, uint32_t layer_mask_controller, uint32_t layer_mask_ray);
+	input_profile(scene & scene, const std::filesystem::path & json_profile, uint32_t layer_mask_controller, uint32_t layer_mask_ray, XrAction left_trigger = XR_NULL_HANDLE, XrAction right_trigger = XR_NULL_HANDLE);
 
 	// application::poll_actions() must have been called before
-	void apply(entt::registry & scene, XrSpace world_space, XrTime predicted_display_time, bool hide_left, bool hide_right, std::span<glm::vec4> pointer_limits);
+	void apply(
+	        entt::registry & scene,
+	        XrSpace world_space,
+	        XrTime predicted_display_time,
+	        bool hide_left_controller,
+	        bool hide_left_ray,
+	        bool hide_right_controller,
+	        bool hide_right_ray,
+	        std::span<glm::mat4> world_to_window);
 };

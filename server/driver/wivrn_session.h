@@ -19,24 +19,35 @@
 
 #pragma once
 
+#include "app_pacer.h"
 #include "clock_offset.h"
-#include "driver/app_pacer.h"
+#include "compositor/compositor.h"
+#include "inplace_vector.hpp"
+#include "tracking_control.h"
+#include "utils/thread_safe.h"
+#include "wivrn_android_face_tracker.h"
+#include "wivrn_body_tracker.h"
 #include "wivrn_connection.h"
 #include "wivrn_controller.h"
-#include "wivrn_hand_interaction.h"
+#include "wivrn_eye_tracker.h"
+#include "wivrn_fb_face2_tracker.h"
+#include "wivrn_gamepad.h"
+#include "wivrn_generic_tracker.h"
 #include "wivrn_hmd.h"
+#include "wivrn_htc_face_tracker.h"
 #include "wivrn_ipc.h"
 #include "wivrn_packets.h"
+#include "wivrn_uinput.h"
 #include "xrt/xrt_results.h"
 #include "xrt/xrt_system.h"
-#include <atomic>
-#include <fstream>
+#include <map>
 #include <memory>
 #include <mutex>
-#include <shared_mutex>
+#include <optional>
 #include <thread>
 
-struct u_system;
+struct b_system;
+struct ipc_server;
 struct xrt_space_overseer;
 struct xrt_system_compositor;
 union xrt_session_event;
@@ -44,58 +55,27 @@ union xrt_session_event;
 namespace wivrn
 {
 class wivrn_eye_tracker;
+class wivrn_android_face_tracker;
 class wivrn_fb_face2_tracker;
 class wivrn_htc_face_tracker;
+class wivrn_body_tracker;
 class wivrn_generic_tracker;
 struct audio_device;
-struct wivrn_comp_target;
-struct wivrn_comp_target_factory;
-
-class tracking_control_t
-{
-	using T = std::chrono::nanoseconds::rep;
-	std::atomic<T> min;
-	std::atomic<T> max;
-	std::chrono::steady_clock::time_point next_sample;
-	std::mutex mutex;
-	decltype(to_headset::tracking_control::enabled) enabled;
-
-public:
-	tracking_control_t() :
-	        next_sample(std::chrono::steady_clock::now())
-	{
-		enabled.fill(true);
-	}
-	void add(std::chrono::nanoseconds s)
-	{
-		auto sample = s.count();
-		T prev = max;
-		while (prev < sample and max.compare_exchange_weak(prev, sample))
-		{
-		}
-		if (sample > 0)
-		{
-			prev = min;
-			while (prev > sample and min.compare_exchange_weak(prev, sample))
-			{
-			}
-		}
-	}
-	void send(wivrn_connection & connection, bool now = false);
-
-	bool get_enabled(to_headset::tracking_control::id id);
-	// Return true if value changed
-	bool set_enabled(to_headset::tracking_control::id id, bool enabled);
-};
 
 class wivrn_session : public xrt_system_devices
 {
-	friend wivrn_comp_target_factory;
 	std::unique_ptr<wivrn_connection> connection;
+	from_headset::headset_info_packet headset_info;
+	// run-time editable settings
+	thread_safe<from_headset::settings_changed> settings;
+
+	wivrn::compositor compositor;
 	pacing_app_factory app_pacers;
 
-	u_system & xrt_system;
+	b_system & xrt_system;
+	ipc_server * mnd_ipc_server;
 	xrt_space_overseer * space_overseer;
+	xrt_system_compositor * system_compositor;
 
 	std::mutex roles_mutex;
 	xrt_system_roles roles{
@@ -105,79 +85,95 @@ class wivrn_session : public xrt_system_devices
 	        .gamepad = -1,
 	};
 
-	tracking_control_t tracking_control;
+	tracking_control control;
 
 	wivrn_hmd hmd;
 	wivrn_controller left_controller;
 	int32_t left_controller_index;
-	wivrn_hand_interaction left_hand_interaction;
-	int32_t left_hand_interaction_index;
 	wivrn_controller right_controller;
 	int32_t right_controller_index;
-	wivrn_hand_interaction right_hand_interaction;
+	wivrn_controller left_hand_interaction;
+	int32_t left_hand_interaction_index;
+	wivrn_controller right_hand_interaction;
 	int32_t right_hand_interaction_index;
-	std::unique_ptr<wivrn_eye_tracker> eye_tracker;
-	std::unique_ptr<wivrn_fb_face2_tracker> fb_face2_tracker;
-	std::unique_ptr<wivrn_htc_face_tracker> htc_face_tracker;
-	std::vector<std::unique_ptr<wivrn_generic_tracker>> generic_trackers;
-
-	std::shared_mutex comp_target_mutex;
-	wivrn_comp_target * comp_target;
+	std::optional<wivrn_eye_tracker> eye_tracker;
+	std::optional<wivrn_gamepad> gamepad_device;
+	std::optional<wivrn_android_face_tracker> android_face_tracker;
+	std::optional<wivrn_fb_face2_tracker> fb_face2_tracker;
+	std::optional<wivrn_htc_face_tracker> htc_face_tracker;
+	std::optional<wivrn_body_tracker> body_tracker;
+	beman::inplace_vector::inplace_vector<wivrn_generic_tracker, from_headset::htc_body::max_tracked_poses> generic_trackers;
+	std::optional<wivrn_uinput> uinput_handler;
+	bool gamepad_connected = false; // network thread only
 
 	clock_offset_estimator offset_est;
+	std::atomic<XrDuration> tracking_latency; // production to reception time
 
-	std::mutex csv_mutex;
-	std::ofstream feedback_csv;
+	std::unique_ptr<audio_device> audio_handle;
 
-	std::shared_ptr<audio_device> audio_handle;
+	// when sessions shall be destroyed, key is client id, value is timestamp
+	thread_safe<std::map<uint32_t, int64_t>> session_loss;
 
-	std::jthread thread;
+	std::jthread net_thread;
+	std::jthread worker_thread;
 
-	wivrn_session(std::unique_ptr<wivrn_connection> connection, u_system &);
+	thread_safe<std::exception_ptr> net_exception;
+
+	wivrn_session(std::unique_ptr<wivrn_connection> connection, b_system &);
 
 public:
+	using base_t = xrt_system_devices;
 	~wivrn_session();
 
 	static xrt_result_t create_session(std::unique_ptr<wivrn_connection> connection,
-	                                   u_system & system,
+	                                   b_system & system,
 	                                   xrt_system_devices ** out_xsysd,
 	                                   xrt_space_overseer ** out_xspovrs,
 	                                   xrt_system_compositor ** out_xsysc);
 
+	void start(ipc_server *);
+	void stop();
+
+	void request_stop();
+	void quit_if_no_client();
+
 	clock_offset get_offset();
 	bool connected();
-	const from_headset::headset_info_packet & get_info()
+	const from_headset::headset_info_packet & get_info() const
 	{
-		return connection->info();
+		return headset_info;
 	};
 
-	void unset_comp_target();
+	float default_fps();
+
+	locked<from_headset::settings_changed> get_settings()
+	{
+		return settings.lock();
+	}
 
 	wivrn_hmd & get_hmd()
 	{
 		return hmd;
 	}
 
-	void add_predict_offset(std::chrono::nanoseconds off)
-	{
-		tracking_control.add(off);
-	}
-
-	void set_enabled(to_headset::tracking_control::id id, bool enabled);
-	void set_enabled(device_id id, bool enabled);
-	void update_tracker_enabled();
+	void add_tracking_request(device_id, int64_t at_ns, int64_t produced_ns, int64_t now);
+	void add_tracking_request(device_id, int64_t at_ns, int64_t produced_ns);
 
 	void operator()(from_headset::crypto_handshake &&) {}
 	void operator()(from_headset::pin_check_1 &&) {}
 	void operator()(from_headset::pin_check_3 &&) {}
 	void operator()(from_headset::headset_info_packet &&);
+	void operator()(const from_headset::settings_changed &);
 	void operator()(from_headset::handshake &&) {}
-	void operator()(from_headset::trackings &&);
 	void operator()(const from_headset::tracking &);
 	void operator()(from_headset::derived_pose &&);
 	void operator()(from_headset::hand_tracking &&);
-	void operator()(from_headset::body_tracking &&);
+	void operator()(from_headset::meta_body &&);
+	void operator()(from_headset::meta_body_skeleton &&);
+	void operator()(from_headset::bd_body &&);
+	void operator()(from_headset::htc_body &&);
 	void operator()(from_headset::inputs &&);
+	void operator()(from_headset::hid::input && e);
 	void operator()(from_headset::timesync_response &&);
 	void operator()(from_headset::feedback &&);
 	void operator()(from_headset::battery &&);
@@ -185,40 +181,78 @@ public:
 	void operator()(from_headset::session_state_changed &&);
 	void operator()(from_headset::user_presence_changed &&);
 	void operator()(from_headset::refresh_rate_changed &&);
+	void operator()(from_headset::stream_tab_changed &&);
 	void operator()(from_headset::override_foveation_center &&);
 	void operator()(from_headset::get_application_list &&);
 	void operator()(const from_headset::start_app &);
+	void operator()(const from_headset::get_running_applications &);
+	void operator()(const from_headset::set_active_application &);
+	void operator()(const from_headset::stop_application &);
 	void operator()(audio_data &&);
 
+	void operator()(to_monado::stop &&);
 	void operator()(to_monado::disconnect &&);
 	void operator()(to_monado::set_bitrate &&);
+	void operator()(to_headset::stream_tab_change &&);
 
+	bool has_stream()
+	{
+		return connection->has_stream();
+	}
 	template <typename T>
 	void send_stream(T && packet)
 	{
-		connection->send_stream(std::forward<T>(packet));
+		try
+		{
+			connection->send_stream(std::forward<T>(packet));
+		}
+		catch (std::exception & e)
+		{
+			*net_exception.lock() = std::current_exception();
+			throw;
+		}
 	}
 
 	template <typename T>
 	void send_control(T && packet)
 	{
-		connection->send_control(std::forward<T>(packet));
+		try
+		{
+			connection->send_control(std::forward<T>(packet));
+		}
+		catch (std::exception & e)
+		{
+			*net_exception.lock() = std::current_exception();
+			throw;
+		}
 	}
 
 	xrt_result_t push_event(const xrt_session_event &);
 
 	void set_foveated_size(uint32_t width, uint32_t height);
 
-	void dump_time(const std::string & event, uint64_t frame, int64_t time, uint8_t stream = -1, const char * extra = "");
-
 private:
-	void run(std::stop_token stop);
-	void reconnect();
+	void run_net(std::stop_token stop);
+	void run_worker(std::stop_token stop);
+	void reconnect(std::stop_token stop);
+
+	void pause_session();
+	void resume_session();
+
+	// nullopt for id stops all apps
+	void stop_application(std::optional<uint32_t> id, int64_t timeout_ns);
+
+	void update_client_states(bool visible, bool focused);
+	void poll_session_loss();
+
+	// checks if a headset is usable with this session
+	std::pair<bool, std::optional<std::string>> validate_headset_info(const from_headset::headset_info_packet & info);
 
 	// xrt_system implementation
 	xrt_result_t get_roles(xrt_system_roles * out_roles);
 	xrt_result_t feature_inc(xrt_device_feature_type type);
 	xrt_result_t feature_dec(xrt_device_feature_type type);
+	void destroy();
 };
 
 } // namespace wivrn

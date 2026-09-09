@@ -19,23 +19,25 @@
 
 #pragma once
 
+#include "render/image_loader.h"
 #include "render/scene_loader.h"
+#include "render/scene_renderer.h"
+#include "utils/cache.h"
 #include "xr/actionset.h"
 #include "xr/instance.h"
 #include "xr/session.h"
 #include "xr/swapchain.h"
 #include "xr/system.h"
+#include <inplace_vector.hpp>
 
 #include <cstdint>
+#include <entt/entity/registry.hpp>
 #include <filesystem>
+#include <functional>
 #include <span>
 #include <string>
 #include <unordered_map>
 #include <vector>
-
-#include "render/imgui_impl.h"
-#include "render/scene_renderer.h"
-#include <entt/entity/registry.hpp>
 #include <openxr/openxr.h>
 
 // See http://www.nirfriedman.com/2018/04/29/unforgettable-factory/
@@ -86,21 +88,26 @@ protected:
 	XrViewConfigurationType viewconfig;
 	bool focused = false;
 
+public:
 	vk::raii::Instance & vk_instance;
 	vk::raii::Device & device;
 	vk::raii::PhysicalDevice & physical_device;
 	thread_safe<vk::raii::Queue> & queue;
-	vk::raii::CommandPool & commandpool;
 	uint32_t queue_family_index;
+
+protected:
+	vk::raii::CommandPool & commandpool;
 
 	const meta & current_meta;
 
-	std::optional<scene_renderer> renderer;
+	std::shared_ptr<scene_renderer> renderer;
 
-public:
-	std::optional<scene_loader> loader;
+	using gltf_cache_type = utils::cache<std::string, entt::registry, scene_loader>;
+	std::shared_ptr<gltf_cache_type> gltf_cache;
 
-protected:
+	using image_cache_type = utils::cache<std::string, loaded_image, image_loader>;
+	std::shared_ptr<image_cache_type> image_cache;
+
 	vk::Format swapchain_format;
 	vk::Format depth_format;
 	bool composition_layer_depth_test_supported;
@@ -126,11 +133,12 @@ protected:
 
 	struct layer
 	{
+		static const int max_views = 2;
+
 		std::variant<XrCompositionLayerProjection, XrCompositionLayerQuad, XrCompositionLayerBaseHeader *> composition_layer;
 
-		// TODO in place vectors
-		std::vector<XrCompositionLayerProjectionView> color_views; // Used by XrCompositionLayerProjection
-		std::vector<XrCompositionLayerDepthInfoKHR> depth_views;   // Used by XrCompositionLayerProjection
+		beman::inplace_vector::inplace_vector<XrCompositionLayerProjectionView, max_views> color_views; // Used by XrCompositionLayerProjection
+		beman::inplace_vector::inplace_vector<XrCompositionLayerDepthInfoKHR, max_views> depth_views;   // Used by XrCompositionLayerProjection
 
 		std::optional<XrCompositionLayerColorScaleBiasKHR> color_scale_bias;
 		std::optional<XrCompositionLayerDepthTestFB> depth_test;
@@ -162,8 +170,8 @@ protected:
 	void add_projection_layer(
 	        XrCompositionLayerFlags flags,
 	        XrSpace space,
-	        std::vector<XrCompositionLayerProjectionView> && color_views,
-	        std::vector<XrCompositionLayerDepthInfoKHR> && depth_views = {});
+	        std::span<XrCompositionLayerProjectionView> color_views,
+	        std::span<XrCompositionLayerDepthInfoKHR> depth_views = {});
 
 	void add_quad_layer(
 	        XrCompositionLayerFlags flags,
@@ -181,7 +189,8 @@ protected:
 	        uint32_t height,
 	        bool keep_depth_buffer,
 	        uint32_t layer_mask,
-	        XrColor4f clear_color);
+	        XrColor4f clear_color,
+	        bool render_debug_draws = false);
 
 	void set_color_scale_bias(XrColor4f scale, XrColor4f bias);
 	void set_depth_test(bool write, XrCompareOpFB op);
@@ -193,7 +202,7 @@ protected:
 	virtual void on_focused();
 
 public:
-	scene(key, const meta &, std::span<const vk::Format> supported_color_formats, std::span<const vk::Format> supported_depth_formats);
+	scene(key, const meta &, std::span<const vk::Format> supported_color_formats, std::span<const vk::Format> supported_depth_formats, scene * parent_scene);
 
 	virtual ~scene();
 
@@ -201,9 +210,32 @@ public:
 	virtual void render(const XrFrameState &) = 0;
 	virtual void on_xr_event(const xr::event &);
 
+	virtual bool on_input_key_down(uint8_t key_code);
+	virtual bool on_input_key_up(uint8_t key_code);
+	virtual bool on_input_mouse_move(float x, float y);
+	virtual bool on_input_button_down(uint8_t button);
+	virtual bool on_input_button_up(uint8_t button);
+	virtual bool on_input_scroll(float h, float v);
+
 	entt::registry world;
-	std::pair<entt::entity, components::node &> load_gltf(const std::filesystem::path & path, uint32_t layer_mask = -1);
-	void remove(entt::entity entity); // TODO
+
+	std::shared_ptr<renderer::material> create_material(std::function<void(renderer::material &)> init = {}) const;
+
+	std::shared_ptr<entt::registry> load_gltf(const std::filesystem::path & path, std::function<void(float)> progress_cb = {});
+	void unload_gltf(const std::filesystem::path & path);
+	std::pair<entt::entity, components::node &> add_gltf(std::shared_ptr<entt::registry> gltf, uint32_t layer_mask = -1);
+	std::pair<entt::entity, components::node &> add_gltf(const std::filesystem::path & path, uint32_t layer_mask = -1);
+	void clear_texture_cache()
+	{
+		gltf_cache->loader().clear_texture_cache();
+	}
+
+	void clear_gltf_cache()
+	{
+		gltf_cache->clear();
+	}
+
+	void remove(entt::entity entity);
 };
 
 template <typename T>
@@ -221,8 +253,14 @@ class scene_impl : public scene
 
 	static inline bool registered = scene_impl<T>::register_scene();
 
-	scene_impl(std::span<const vk::Format> supported_color_formats, std::span<const vk::Format> supported_depth_formats = {}) :
-	        scene(key{}, T::get_meta_scene(), supported_color_formats, supported_depth_formats)
+	scene_impl(std::span<const vk::Format> supported_color_formats, std::span<const vk::Format> supported_depth_formats, scene & parent_scene) :
+	        scene(key{}, T::get_meta_scene(), supported_color_formats, supported_depth_formats, &parent_scene)
+	{
+		(void)registered;
+	}
+
+	scene_impl(std::span<const vk::Format> supported_color_formats, std::span<const vk::Format> supported_depth_formats) :
+	        scene(key{}, T::get_meta_scene(), supported_color_formats, supported_depth_formats, nullptr)
 	{
 		(void)registered;
 	}

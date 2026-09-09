@@ -85,24 +85,14 @@ void wivrn::UDP::bind(sockaddr_in6 address)
 		throw std::system_error{errno, std::generic_category()};
 }
 
-void wivrn::UDP::connect(in6_addr address, int port)
+void wivrn::UDP::connect(sockaddr_in6 sa)
 {
-	sockaddr_in6 sa;
-	sa.sin6_family = AF_INET6;
-	sa.sin6_addr = address;
-	sa.sin6_port = htons(port);
-
 	if (::connect(fd, (sockaddr *)&sa, sizeof(sa)) < 0)
 		throw std::system_error{errno, std::generic_category()};
 }
 
-void wivrn::UDP::connect(in_addr address, int port)
+void wivrn::UDP::connect(sockaddr_in sa)
 {
-	sockaddr_in sa;
-	sa.sin_family = AF_INET;
-	sa.sin_addr = address;
-	sa.sin_port = htons(port);
-
 	if (::connect(fd, (sockaddr *)&sa, sizeof(sa)) < 0)
 		throw std::system_error{errno, std::generic_category()};
 }
@@ -173,17 +163,12 @@ wivrn::TCP::TCP(int fd)
 	init();
 }
 
-wivrn::TCP::TCP(in6_addr address, int port)
+wivrn::TCP::TCP(sockaddr_in6 sa)
 {
 	fd = socket(AF_INET6, SOCK_STREAM, 0);
 	if (fd < 0)
 		throw std::system_error{errno, std::generic_category()};
 	fcntl(fd, F_SETFD, FD_CLOEXEC);
-
-	sockaddr_in6 sa;
-	sa.sin6_family = AF_INET6;
-	sa.sin6_addr = address;
-	sa.sin6_port = htons(port);
 
 	if (connect(fd, (sockaddr *)&sa, sizeof(sa)) < 0)
 	{
@@ -194,17 +179,12 @@ wivrn::TCP::TCP(in6_addr address, int port)
 	init();
 }
 
-wivrn::TCP::TCP(in_addr address, int port)
+wivrn::TCP::TCP(sockaddr_in sa)
 {
 	fd = socket(AF_INET, SOCK_STREAM, 0);
 	if (fd < 0)
 		throw std::system_error{errno, std::generic_category()};
 	fcntl(fd, F_SETFD, FD_CLOEXEC);
-
-	sockaddr_in sa;
-	sa.sin_family = AF_INET;
-	sa.sin_addr = address;
-	sa.sin_port = htons(port);
 
 	if (connect(fd, (sockaddr *)&sa, sizeof(sa)) < 0)
 	{
@@ -255,18 +235,14 @@ std::pair<wivrn::deserialization_packet, sockaddr_in6> wivrn::UDP::receive_from_
 	sockaddr_in6 addr;
 	socklen_t addrlen = sizeof(addr);
 
-	size_t size = recvfrom(fd, nullptr, 0, MSG_PEEK | MSG_TRUNC, (sockaddr *)&addr, &addrlen);
-
-#if defined(__cpp_lib_smart_ptr_for_overwrite) && __cpp_lib_smart_ptr_for_overwrite >= 202002L
-	auto buffer = std::make_shared_for_overwrite<uint8_t[]>(size);
-#else
-	std::shared_ptr<uint8_t[]> buffer(new uint8_t[size]);
-#endif
-	ssize_t received = recvfrom(fd, buffer.get(), size, 0, (sockaddr *)&addr, &addrlen);
-	if (received < 0)
+	ssize_t peeked = recvfrom(fd, nullptr, 0, MSG_PEEK | MSG_TRUNC, (sockaddr *)&addr, &addrlen);
+	if (peeked < 0)
 		throw std::system_error{errno, std::generic_category()};
 
-	bytes_received_ += received;
+	auto buffer = std::make_shared_for_overwrite<uint8_t[]>(peeked);
+	ssize_t received = recvfrom(fd, buffer.get(), peeked, 0, (sockaddr *)&addr, &addrlen);
+	if (received < 0)
+		throw std::system_error{errno, std::generic_category()};
 
 	std::span message{buffer.get(), (size_t)received};
 
@@ -310,29 +286,25 @@ wivrn::deserialization_packet wivrn::UDP::receive_raw()
 
 	static const size_t message_size = 2048;
 	static const size_t num_messages = 20;
-#if defined(__cpp_lib_smart_ptr_for_overwrite) && __cpp_lib_smart_ptr_for_overwrite >= 202002L
-	buffer = std::make_shared_for_overwrite<uint8_t[]>(message_size * num_messages);
-#else
-	buffer.reset(new uint8_t[message_size * num_messages]);
-#endif
-	std::vector<iovec> iovecs;
-	std::vector<mmsghdr> mmsgs;
-	iovecs.reserve(num_messages);
-	mmsgs.reserve(num_messages);
+	if ((not buffer) or buffer.use_count() > 1)
+	{
+		buffer = std::make_shared_for_overwrite<uint8_t[]>(message_size * num_messages);
+	}
+	std::array<iovec, num_messages> iovecs;
+	std::array<mmsghdr, num_messages> mmsgs;
 	for (size_t i = 0; i < num_messages; ++i)
 	{
-		iovecs.push_back({
+		iovecs[i] = {
 		        .iov_base = buffer.get() + message_size * i,
 		        .iov_len = message_size,
-		});
+		};
 
-		mmsgs.push_back(
-		        {
-		                .msg_hdr = {
-		                        .msg_iov = &iovecs.back(),
-		                        .msg_iovlen = 1,
-		                },
-		        });
+		mmsgs[i] = {
+		        .msg_hdr = {
+		                .msg_iov = &iovecs[i],
+		                .msg_iovlen = 1,
+		        },
+		};
 	}
 
 	int received = recvmmsg(fd, mmsgs.data(), num_messages, MSG_DONTWAIT, nullptr);
@@ -346,8 +318,6 @@ wivrn::deserialization_packet wivrn::UDP::receive_raw()
 
 	for (int i = received - 1; i >= 0; --i)
 	{
-		bytes_received_ += mmsgs[i].msg_len;
-
 		std::span<uint8_t> message{(uint8_t *)iovecs[i].iov_base, mmsgs[i].msg_len};
 		assert(message.data() != nullptr);
 
@@ -376,7 +346,7 @@ wivrn::deserialization_packet wivrn::UDP::receive_raw()
 	__builtin_unreachable();
 }
 
-void wivrn::UDP::send_raw(serialization_packet && packet)
+size_t wivrn::UDP::send_raw(serialization_packet && packet)
 {
 	thread_local std::vector<iovec> iovecs;
 	iovecs.clear();
@@ -399,23 +369,21 @@ void wivrn::UDP::send_raw(serialization_packet && packet)
 	}
 
 	for (const auto & span: data)
-	{
 		iovecs.emplace_back(span.data(), span.size());
-		bytes_sent_ += span.size();
-	}
 
-	if (::writev(fd, iovecs.data(), iovecs.size()) < 0)
-		throw std::system_error{errno, std::generic_category()};
+	if (ssize_t sent = ::writev(fd, iovecs.data(), iovecs.size()); sent >= 0)
+		return sent;
+	throw std::system_error{errno, std::generic_category()};
 }
 
-void wivrn::UDP::send_many_raw(std::span<serialization_packet> packets)
+size_t wivrn::UDP::send_many_raw(std::span<serialization_packet> packets)
 {
 	thread_local std::vector<iovec> iovecs;
 	thread_local std::vector<mmsghdr> mmsgs;
 	thread_local std::vector<uint64_t> iv_counters;
 
 	if (packets.empty())
-		return;
+		return 0;
 
 	iovecs.clear();
 	mmsgs.clear();
@@ -423,6 +391,7 @@ void wivrn::UDP::send_many_raw(std::span<serialization_packet> packets)
 
 	iv_counters.reserve(packets.size());
 
+	size_t sent = 0;
 	for (serialization_packet & packet: packets)
 	{
 		std::vector<std::span<uint8_t>> & data = packet;
@@ -444,7 +413,7 @@ void wivrn::UDP::send_many_raw(std::span<serialization_packet> packets)
 		for (const auto & span: data)
 		{
 			iovecs.emplace_back(span.data(), span.size_bytes());
-			bytes_sent_ += span.size();
+			sent += span.size();
 		}
 
 		if (encrypted)
@@ -462,10 +431,13 @@ void wivrn::UDP::send_many_raw(std::span<serialization_packet> packets)
 	// sendmmsg may not send all messages, just consider them as lost for UDP
 	if (sendmmsg(fd, mmsgs.data(), mmsgs.size(), 0) < 0)
 		throw std::system_error{errno, std::generic_category()};
+	return sent;
 }
 
 wivrn::deserialization_packet wivrn::TCP::receive_raw()
 {
+	static constexpr size_t max_payload = 16 * 1024 * 1024;
+
 	ssize_t expected_size;
 
 	if (data.size_bytes() < sizeof(uint32_t))
@@ -475,6 +447,8 @@ wivrn::deserialization_packet wivrn::TCP::receive_raw()
 	else
 	{
 		uint32_t payload_size = *reinterpret_cast<uint32_t *>(data.data());
+		if (payload_size > max_payload)
+			throw std::runtime_error("Invalid packet: size " + std::to_string(payload_size));
 		expected_size = payload_size + sizeof(uint32_t) - data.size_bytes();
 	}
 
@@ -483,11 +457,7 @@ wivrn::deserialization_packet wivrn::TCP::receive_raw()
 		size_t new_size = std::max<size_t>(data.size_bytes() + expected_size,
 		                                   4096);
 		auto old = std::move(buffer);
-#if defined(__cpp_lib_smart_ptr_for_overwrite) && __cpp_lib_smart_ptr_for_overwrite >= 202002L
 		buffer = std::make_shared_for_overwrite<uint8_t[]>(new_size);
-#else
-		buffer.reset(new uint8_t[new_size]);
-#endif
 		memcpy(buffer.get(), data.data(), data.size_bytes());
 		data = std::span(buffer.get(), data.size());
 		capacity_left = new_size - data.size_bytes();
@@ -502,8 +472,6 @@ wivrn::deserialization_packet wivrn::TCP::receive_raw()
 
 		if (received_size == 0)
 			throw socket_shutdown{};
-
-		bytes_received_ += received_size;
 
 		if (decrypter)
 		{
@@ -547,8 +515,9 @@ wivrn::deserialization_packet wivrn::TCP::receive_pending()
 	return deserialization_packet{buffer, span};
 }
 
-void wivrn::TCP::send_raw(serialization_packet && packet)
+size_t wivrn::TCP::send_raw(serialization_packet && packet)
 {
+	size_t total_sent = 0;
 	thread_local std::vector<iovec> iovecs;
 	iovecs.clear();
 
@@ -589,7 +558,7 @@ void wivrn::TCP::send_raw(serialization_packet && packet)
 		if (sent < 0)
 			throw std::system_error{errno, std::generic_category()};
 
-		bytes_sent_ += sent;
+		total_sent += sent;
 
 		// iov fully consumed
 		while (hdr.msg_iovlen > 0 and sent >= hdr.msg_iov[0].iov_len)
@@ -599,20 +568,20 @@ void wivrn::TCP::send_raw(serialization_packet && packet)
 			--hdr.msg_iovlen;
 		}
 		if (hdr.msg_iovlen == 0)
-			return;
+			return total_sent;
 		hdr.msg_iov[0].iov_base = (void *)((uintptr_t)hdr.msg_iov[0].iov_base + sent);
 		hdr.msg_iov[0].iov_len -= sent;
 	}
 }
 
-void wivrn::TCP::send_many_raw(std::span<serialization_packet> packets)
+size_t wivrn::TCP::send_many_raw(std::span<serialization_packet> packets)
 {
 	thread_local std::vector<iovec> iovecs;
 	thread_local std::vector<uint32_t> sizes;
 	thread_local std::vector<std::span<uint8_t>> spans;
 
 	if (packets.empty())
-		return;
+		return 0;
 
 	iovecs.clear();
 	sizes.clear();
@@ -652,6 +621,7 @@ void wivrn::TCP::send_many_raw(std::span<serialization_packet> packets)
 		encrypter.encrypt_in_place(spans);
 	}
 
+	size_t total_sent = 0;
 	while (true)
 	{
 		ssize_t sent = ::sendmsg(fd, &hdr, MSG_NOSIGNAL);
@@ -662,7 +632,7 @@ void wivrn::TCP::send_many_raw(std::span<serialization_packet> packets)
 		if (sent < 0)
 			throw std::system_error{errno, std::generic_category()};
 
-		bytes_sent_ += sent;
+		total_sent += sent;
 
 		// iov fully consumed
 		while (hdr.msg_iovlen > 0 and sent >= hdr.msg_iov[0].iov_len)
@@ -672,7 +642,7 @@ void wivrn::TCP::send_many_raw(std::span<serialization_packet> packets)
 			--hdr.msg_iovlen;
 		}
 		if (hdr.msg_iovlen == 0)
-			return;
+			return total_sent;
 		hdr.msg_iov[0].iov_base = (void *)((uintptr_t)hdr.msg_iov[0].iov_base + sent);
 		hdr.msg_iov[0].iov_len -= sent;
 	}

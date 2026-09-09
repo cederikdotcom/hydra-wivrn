@@ -21,359 +21,592 @@
 #include "escape_string.h"
 #include "gui_config.h"
 #include "utils/flatpak.h"
+#include "wivrn_config.h"
 #include "wivrn_server.h"
 #include <QList>
 #include <QObject>
-#include <QPointF>
-#include <QRectF>
-#include <QSizeF>
 #include <cassert>
+#include <fcntl.h>
 #include <nlohmann/json.hpp>
 #include <qqmlintegration.h>
+#include <unistd.h>
 
 namespace
 {
-const std::vector<std::pair<encoder::encoder_name, std::string>> encoder_ids{
-        {encoder::encoder_name::nvenc, "nvenc"},
-        {encoder::encoder_name::vaapi, "vaapi"},
-        {encoder::encoder_name::x264, "x264"},
-        {encoder::encoder_name::vulkan, "vulkan"},
+const std::vector<std::pair<Settings::encoder_name, std::string>> encoder_ids{
+        {Settings::encoder_name::Nvenc, "nvenc"},
+        {Settings::encoder_name::Vaapi, "vaapi"},
+        {Settings::encoder_name::X264, "x264"},
+        {Settings::encoder_name::Vulkan, "vulkan"},
 };
 
-const std::vector<std::pair<encoder::video_codec, std::string>> codec_ids{
-        {encoder::video_codec::h264, "h264"},
-        {encoder::video_codec::h264, "avc"},
-        {encoder::video_codec::h265, "h265"},
-        {encoder::video_codec::h265, "hevc"},
-        {encoder::video_codec::av1, "av1"},
-        {encoder::video_codec::av1, "AV1"},
+const std::vector<std::tuple<Settings::video_codec, std::string>> codec_ids{
+        {Settings::video_codec::H264, "h264"},
+        {Settings::video_codec::H264, "avc"},
+        {Settings::video_codec::H265, "h265"},
+        {Settings::video_codec::H265, "hevc"},
+        {Settings::video_codec::Av1, "av1"},
+        {Settings::video_codec::Av1, "AV1"},
 };
+
+bool can10bit(Settings::video_codec c)
+{
+	switch (c)
+	{
+		case Settings::CodecAuto:
+		case Settings::H264:
+			return false;
+		case Settings::H265:
+		case Settings::Av1:
+			return true;
+	}
+	return false;
+}
 } // namespace
 
-std::optional<encoder::encoder_name> Settings::encoder_id_from_string(std::string_view s)
+Settings::encoder_name Settings::encoder_id_from_string(std::string_view s)
 {
 	for (auto & [i, j]: encoder_ids)
 	{
 		if (j == s)
 			return i;
 	}
-	return std::nullopt;
+	return Settings::encoder_name::EncoderAuto;
 }
 
-std::optional<encoder::video_codec> Settings::codec_id_from_string(std::string_view s)
+Settings::video_codec Settings::codec_id_from_string(std::string_view s)
 {
 	for (auto & [i, j]: codec_ids)
 	{
 		if (j == s)
 			return i;
 	}
-	return std::nullopt;
+	return Settings::video_codec::CodecAuto;
 }
 
-const std::string & Settings::encoder_from_id(std::optional<encoder::encoder_name> id)
+const std::string & Settings::encoder_from_id(Settings::encoder_name id)
 {
 	static const std::string default_value = "auto";
-	if (not id)
-		return default_value;
 
 	for (auto & [i, j]: encoder_ids)
 	{
-		if (i == *id)
+		if (i == id)
 			return j;
 	}
 
 	return default_value;
 }
 
-const std::string & Settings::codec_from_id(std::optional<encoder::video_codec> id)
+const std::string & Settings::codec_from_id(Settings::video_codec id)
 {
 	static const std::string default_value = "auto";
-	if (not id)
-		return default_value;
 
 	for (auto & [i, j]: codec_ids)
 	{
-		if (i == *id)
+		if (i == id)
 			return j;
 	}
 
 	return default_value;
+}
+
+void Settings::emitAllChanged()
+{
+	simpleConfigChanged();
+	encoderChanged();
+	codecChanged();
+	tenbitChanged();
+	tcpOnlyChanged();
+	applicationChanged();
+	openvrChanged();
+	debugGuiChanged();
+	steamVrLhChanged();
+	lhMaxExtrapolationEnabledChanged();
+	lhMaxExtrapolationChanged();
+	lhStickDeadzoneChanged();
+	hidForwardingChanged();
+	portChanged();
+	hostnameChanged();
 }
 
 void Settings::load(const wivrn_server * server)
 {
 	// Encoders configuration
-	nlohmann::json json_doc;
 	try
 	{
 		auto conf = server->jsonConfiguration();
-		json_doc = nlohmann::json::parse(conf.toUtf8());
+		m_jsonSettings = nlohmann::json::parse(conf.toUtf8());
+		m_originalSettings = m_jsonSettings;
+		if (not m_jsonSettings.is_object())
+			m_jsonSettings = nlohmann::json::object();
+		emitAllChanged();
 	}
 	catch (std::exception & e)
 	{
 		qWarning() << "Cannot read configuration: " << e.what();
-		restore_defaults();
+		m_jsonSettings = nlohmann::json::object();
+		emitAllChanged();
 		return;
 	}
+}
 
-	std::vector<encoder> new_encoders;
+static Settings::encoder_name encoder_for_item(const nlohmann::json & item)
+{
+	if (item.is_string())
+		return Settings::encoder_id_from_string(std::string(item));
+	if (item.is_object())
+	{
+		if (auto i = item.find("encoder"); i != item.end())
+			return Settings::encoder_id_from_string(std::string(*i));
+	}
+	return Settings::encoder_name::EncoderAuto;
+}
+
+static Settings::video_codec codec_for_item(const nlohmann::json & item)
+{
+	if (item.is_object())
+	{
+		if (auto i = item.find("codec"); i != item.end())
+			return Settings::codec_id_from_string(std::string(*i));
+	}
+	return Settings::video_codec::CodecAuto;
+}
+
+bool Settings::simpleConfig() const
+{
+	// Simple configuration: either unset, single encoder or all encoders + codecs are the same
 	try
 	{
-		nlohmann::json json_encoders;
+		auto it = m_jsonSettings.find("encoder");
+		if (it == m_jsonSettings.end() or it->is_object() or it->is_string())
+			return true;
+		std::optional<encoder_name> encoder;
+		std::optional<video_codec> codec;
+		for (const auto & item: *it)
+		{
+			auto e = encoder_for_item(item);
+			if (encoder and e != encoder)
+				return false;
+			encoder = e;
 
-		if (json_doc.contains("encoders"))
-		{
-			json_encoders = json_doc["encoders"];
-			set_manualEncoders(true);
+			auto c = codec_for_item(item);
+			if (codec and c != codec)
+				return false;
+			codec = c;
 		}
-		else if (json_doc.contains("encoders.disabled"))
-		{
-			json_encoders = json_doc["encoders.disabled"];
-			set_manualEncoders(false);
-		}
-		else
-		{
-			set_manualEncoders(false);
-		}
-
-		for (auto & i: json_encoders)
-		{
-			encoder enc;
-			enc.name = encoder_id_from_string(i.value("encoder", "auto"));
-			enc.codec = codec_id_from_string(i.value("codec", "auto"));
-			enc.width = i.value("width", 1.0);
-			enc.height = i.value("height", 1.0);
-			enc.offset_x = i.value("offset_x", 0.0);
-			enc.offset_y = i.value("offset_y", 0.0);
-			enc.group = i.value("group", 0); // TODO: handle groups
-			new_encoders.push_back(enc);
-		}
+		return true;
 	}
 	catch (...)
 	{
-		// QMessageBox msgbox{QMessageBox::Information, tr("Invalid settings"), tr("The encoder configuration is invalid, the default values will be restored."), QMessageBox::Close, this};
-		// msgbox.exec();
-
-		new_encoders.clear();
+		return false;
 	}
-	set_encoders(new_encoders);
+}
 
-	if (encoders().empty())
+Settings::encoder_name Settings::encoder() const
+{
+	try
 	{
-		set_manualEncoders(false);
-		std::vector<encoder> new_encoders;
-		new_encoders.push_back(encoder{
-		        .width = 1,
-		        .height = 1,
-		        .offset_x = 0,
-		        .offset_y = 0,
+		auto it = m_jsonSettings.find("encoder");
+		if (it == m_jsonSettings.end())
+			return encoder_name::EncoderAuto;
+		if (it->is_array() and it->size())
+			it = it->begin();
+		return encoder_for_item(*it);
+	}
+	catch (...)
+	{
+	}
+	return encoder_name::EncoderAuto;
+}
+
+void Settings::set_encoder(const encoder_name & value)
+{
+	if (value == encoder())
+		return;
+	auto old_codec = codec();
+	switch (value)
+	{
+		case EncoderAuto:
+			m_jsonSettings.erase("encoder");
+			break;
+		case Nvenc:
+		case Vaapi:
+		case X264:
+		case Vulkan:
+			m_jsonSettings["encoder"] = encoder_from_id(value);
+	}
+	encoderChanged();
+	if (not can10bit())
+		set_tenbit(false);
+	if (old_codec != codec())
+		codecChanged();
+	simpleConfigChanged();
+}
+
+Settings::video_codec Settings::codec() const
+{
+	try
+	{
+		auto it = m_jsonSettings.find("encoder");
+		if (it == m_jsonSettings.end())
+			return video_codec::CodecAuto;
+		if (it->is_array() and it->size())
+			it = it->begin();
+		return codec_for_item(*it);
+	}
+	catch (...)
+	{
+	}
+	return video_codec::CodecAuto;
+}
+
+void Settings::set_codec(const video_codec & value)
+{
+	auto old = codec();
+	auto it = m_jsonSettings.find("encoder");
+	if (it == m_jsonSettings.end())
+		return;
+
+	if (it->is_string())
+	{
+		m_jsonSettings["encoder"] = nlohmann::json::object({
+		        {"encoder", *it},
+		        {"codec", codec_from_id(value)},
 		});
-		set_encoders(new_encoders);
 	}
 
-	// Foveation
-	try
+	if (it->is_object())
 	{
-		if (json_doc.contains("scale"))
+		if (value == CodecAuto)
 		{
-			set_scale(json_doc.value("scale", 1.0));
-		}
-		else
-		{
-			set_scale(-1);
-		}
-	}
-	catch (...)
-	{
-		set_scale(-1);
-	}
-
-	// Bitrate
-	try
-	{
-		set_bitrate(json_doc.value("bitrate", 50'000'000));
-	}
-	catch (...)
-	{
-		set_bitrate(50'000'000);
-	}
-
-	// Automatically started application
-	std::vector<std::string> application;
-	try
-	{
-		if (json_doc["application"].is_array())
-			application = json_doc.value<std::vector<std::string>>("application", {});
-		else if (json_doc["application"].is_string())
-			application.push_back(json_doc["application"]);
-
-		set_application(escape_string(application));
-	}
-	catch (...)
-	{
-		set_application("");
-	}
-
-	// Advanced options (debug window, steamvr_lh)
-	try
-	{
-		set_debugGui(json_doc.value("debug-gui", false));
-	}
-	catch (...)
-	{
-		set_debugGui(false);
-	}
-
-	try
-	{
-		set_steamVrLh(json_doc.value("use-steamvr-lh", false));
-	}
-	catch (...)
-	{
-		set_steamVrLh(false);
-	}
-
-	// OpenVR compat library
-	try
-	{
-		if (auto it = json_doc.find("openvr-compat-path"); it != json_doc.end())
-		{
-			if (it->is_null())
-				set_openvr("-");
+			if (auto encoder = it->find("encoder"); encoder != it->end())
+				*it = *encoder;
 			else
-				set_openvr(QString::fromStdString(*it));
+				m_jsonSettings.erase("encoder");
 		}
 		else
+			(*it)["codec"] = codec_from_id(value);
+	}
+	else if (it->is_array())
+	{
+		for (auto & item: *it)
 		{
-			set_openvr("");
+			if (it->is_string())
+			{
+				item = nlohmann::json::object({
+				        {"encoder", item},
+				        {"codec", codec_from_id(value)},
+				});
+				continue;
+			}
+			if (not item.is_object())
+				continue;
+			if (value == CodecAuto)
+				item.erase("codec");
+			else
+				item["codec"] = codec_from_id(value);
 		}
+	}
+	if (value != old)
+	{
+		if (::can10bit(value) != ::can10bit(old))
+			set_tenbit(::can10bit(value));
+		codecChanged();
+	}
+}
+
+bool Settings::tenbit() const
+{
+	try
+	{
+		return m_jsonSettings.value("bit-depth", 8) == 10;
+	}
+	catch (...)
+	{}
+	return false;
+}
+
+void Settings::set_tenbit(const bool & value)
+{
+	auto old = tenbit();
+	if (codec() == CodecAuto)
+		m_jsonSettings.erase("bit-depth");
+	else
+		m_jsonSettings["bit-depth"] = value ? 10 : 8;
+	if (value != old)
+		tenbitChanged();
+}
+
+QString Settings::application() const
+{
+	// Automatically started application
+	try
+	{
+		std::vector<std::string> application;
+		auto it = m_jsonSettings.find("application");
+		if (it == m_jsonSettings.end())
+			return "";
+		if (it->is_array())
+			application = *it;
+		else if (it->is_string())
+			application.push_back(*it);
+
+		return escape_string(application);
 	}
 	catch (...)
 	{
-		set_openvr("");
+		return "";
 	}
+}
+
+void Settings::set_application(const QString & value)
+{
+	auto old = application();
+	if (value.isEmpty())
+		m_jsonSettings.erase("application");
+	else
+		m_jsonSettings["application"] = unescape_string(value);
+	if (old != value)
+		applicationChanged();
+}
+
+bool Settings::hidForwarding() const
+{
+	auto it = m_jsonSettings.find("hid-forwarding");
+	if (it != m_jsonSettings.end() and it->is_boolean())
+		return *it;
+	return false;
+}
+
+void Settings::set_hidForwarding(const bool & value)
+{
+	auto old = hidForwarding();
+	m_jsonSettings["hid-forwarding"] = value;
+	if (old != value)
+		hidForwardingChanged();
+}
+
+bool Settings::debugGui() const
+{
+	// Advanced options (debug window, steamvr_lh)
+	auto it = m_jsonSettings.find("debug-gui");
+	if (it != m_jsonSettings.end() and it->is_boolean())
+		return *it;
+	return false;
+}
+
+void Settings::set_debugGui(const bool & value)
+{
+	auto old = debugGui();
+	m_jsonSettings["debug-gui"] = value;
+	if (old != value)
+		debugGuiChanged();
+}
+
+bool Settings::steamVrLh() const
+{
+	auto it = m_jsonSettings.find("use-steamvr-lh");
+	if (it != m_jsonSettings.end() and it->is_boolean())
+		return *it;
+	return false;
+}
+
+void Settings::set_steamVrLh(const bool & value)
+{
+	auto old = steamVrLh();
+	m_jsonSettings["use-steamvr-lh"] = value;
+	if (old != value)
+		steamVrLhChanged();
+}
+
+bool Settings::lhMaxExtrapolationEnabled() const
+{
+	auto it = m_jsonSettings.find("lh-max-extrapolation");
+	return it != m_jsonSettings.end() and it->is_number();
+}
+
+int64_t Settings::lhMaxExtrapolation() const
+{
+	auto it = m_jsonSettings.find("lh-max-extrapolation");
+	if (it != m_jsonSettings.end() and it->is_number())
+		return static_cast<int64_t>(*it);
+	return 50;
+}
+
+void Settings::set_lhMaxExtrapolation(const int64_t & value)
+{
+	auto old = lhMaxExtrapolation();
+	if (value != -1)
+	{
+		m_jsonSettings["lh-max-extrapolation"] = value;
+	}
+	else
+	{
+		m_jsonSettings.erase("lh-max-extrapolation");
+	}
+
+	if (old != value)
+	{
+		lhMaxExtrapolationEnabledChanged();
+		lhMaxExtrapolationChanged();
+	}
+}
+
+float Settings::lhStickDeadzone() const
+{
+	auto it = m_jsonSettings.find("lh-stick-deadzone");
+	if (it != m_jsonSettings.end() and it->is_number())
+		return static_cast<float>(*it);
+	return 0.0f;
+}
+
+void Settings::set_lhStickDeadzone(const float & value)
+{
+	auto old = lhStickDeadzone();
+	m_jsonSettings["lh-stick-deadzone"] = value;
+	if (old != value)
+		lhStickDeadzoneChanged();
+}
+
+bool Settings::tcpOnly() const
+{
+	auto it = m_jsonSettings.find("tcp-only");
+	if (it != m_jsonSettings.end() and it->is_boolean())
+		return *it;
+	return false;
+}
+
+void Settings::set_tcpOnly(const bool & value)
+{
+	auto old = tcpOnly();
+	m_jsonSettings["tcp-only"] = value;
+	if (old != value)
+		tcpOnlyChanged();
+}
+
+int Settings::port() const
+{
+	auto it = m_jsonSettings.find("port");
+	if (it != m_jsonSettings.end() and it->is_number_integer())
+		return *it;
+	return wivrn::default_port;
+}
+
+void Settings::set_port(const int & value)
+{
+	auto old = port();
+	m_jsonSettings["port"] = value;
+	if (old != value)
+		portChanged();
+}
+
+QString Settings::hostname() const
+{
+	if (auto it = m_jsonSettings.find("hostname"); it != m_jsonSettings.end() and it->is_string())
+		return QString::fromStdString(*it);
+	return "";
+}
+
+void Settings::set_hostname(const QString & value)
+{
+	auto old = hostname();
+	if (value == "")
+		m_jsonSettings.erase("hostname");
+	else
+		m_jsonSettings["hostname"] = value.toStdString();
+	if (old != value)
+		hostnameChanged();
+}
+
+QString Settings::openvr() const
+{
+	// OpenVR compat library
+	if (auto it = m_jsonSettings.find("openvr-compat-path"); it != m_jsonSettings.end())
+	{
+		if (it->is_null())
+			return "-";
+		if (it->is_string())
+			return QString::fromStdString(*it);
+	}
+	return "";
+}
+
+void Settings::set_openvr(const QString & value)
+{
+	auto old = openvr();
+	if (value == "-")
+		m_jsonSettings["openvr-compat-path"] = nullptr;
+	else if (value == "")
+		m_jsonSettings.erase("openvr-compat-path");
+	else
+		m_jsonSettings["openvr-compat-path"] = value.toStdString();
+	if (old != value)
+		openvrChanged();
+}
+
+QList<Settings::video_codec> Settings::allowedCodecs() const
+{
+	switch (encoder())
+	{
+		case encoder_name::EncoderAuto:
+			return {video_codec::CodecAuto};
+		case encoder_name::Nvenc:
+		case encoder_name::Vaapi:
+			return {
+			        video_codec::CodecAuto,
+			        video_codec::H264,
+			        video_codec::H265,
+			        video_codec::Av1,
+			};
+		case encoder_name::Vulkan:
+			return {
+			        video_codec::CodecAuto,
+			        video_codec::H264,
+			        video_codec::H265,
+			};
+		case encoder_name::X264:
+			return {
+			        video_codec::H264,
+			};
+	}
+	return {video_codec::CodecAuto};
+}
+
+bool Settings::can10bit() const
+{
+	return ::can10bit(codec());
 }
 
 void Settings::save(wivrn_server * server)
 {
-	nlohmann::json json_doc;
-	try
-	{
-		auto conf = server->jsonConfiguration();
-		json_doc = nlohmann::json::parse(conf.toUtf8());
-	}
-	catch (...)
-	{
-	}
-
-	// Remove all optional keys that might not be overwritten
-	auto it = json_doc.find("scale");
-	if (it != json_doc.end())
-		json_doc.erase(it);
-
-	it = json_doc.find("encoders.disabled");
-	if (it != json_doc.end())
-		json_doc.erase(it);
-
-	it = json_doc.find("encoders");
-	if (it != json_doc.end())
-		json_doc.erase(it);
-
-	it = json_doc.find("application");
-	if (it != json_doc.end())
-		json_doc.erase(it);
-
-	if (scale() > 0)
-		json_doc["scale"] = scale();
-
-	json_doc["bitrate"] = bitrate();
-
-	std::vector<nlohmann::json> encoders;
-
-	for (auto & enc: m_encoders)
-	{
-		nlohmann::json encoder;
-
-		if (auto value = encoder_from_id(enc.name); value != "auto")
-			encoder["encoder"] = value;
-		if (auto value = codec_from_id(enc.codec); value != "auto")
-			encoder["codec"] = value;
-		encoder["width"] = enc.width;
-		encoder["height"] = enc.height;
-		encoder["offset_x"] = enc.offset_x;
-		encoder["offset_y"] = enc.offset_y;
-
-		// TODO encoder groups
-
-		encoders.push_back(encoder);
-	}
-
-	std::ranges::stable_sort(encoders, [](const nlohmann::json & i, const nlohmann::json & j) {
-		double size_i = i.value("width", 0.0) * i.value("height", 0.0);
-		double size_j = j.value("width", 0.0) * j.value("height", 0.0);
-		return size_i < size_j;
-	});
-
-	if (manualEncoders())
-		json_doc["encoders"] = encoders;
-	else
-		json_doc["encoders.disabled"] = encoders;
-
-	if (application() != "")
-		json_doc["application"] = unescape_string(application());
-
-	json_doc["debug-gui"] = debugGui();
-	json_doc["use-steamvr-lh"] = steamVrLh();
-
-	if (openvr() == "-")
-		json_doc["openvr-compat-path"] = nullptr;
-	else if (openvr() == "")
-		json_doc.erase("openvr-compat-path");
-	else
-		json_doc["openvr-compat-path"] = openvr().toStdString();
-
-	server->setJsonConfiguration(QString::fromStdString(json_doc.dump(2)));
+	server->setJsonConfiguration(QString::fromStdString(m_jsonSettings.dump(2)));
+	if (m_jsonSettings != m_originalSettings)
+		settingsChanged();
 }
 
 void Settings::restore_defaults()
 {
-	set_encoders({});
-	set_encoderPassthrough({});
-	set_bitrate(50'000'000);
-	set_scale(-1);
-	set_application("");
-	set_debugGui(false);
-	set_steamVrLh(false);
-	set_tcpOnly(false);
-}
-
-void Settings::set_encoder_preset(QJSValue preset)
-{
-	QJSEngine engine;
-	const QJsonArray json_encoders = engine.fromScriptValue<QJsonValue>(preset).toArray();
-
-	std::vector<encoder> encoders;
-	for (const QJsonValue & json_encoder_value: json_encoders)
-	{
-		QJsonObject json_encoder = json_encoder_value.toObject();
-
-		encoders.push_back(encoder{
-		        .name = encoder_id_from_string(json_encoder["encoder"].toString("auto").toStdString()),
-		        .width = json_encoder["width"].toDouble(),
-		        .height = json_encoder["height"].toDouble(),
-		        .offset_x = json_encoder["offset_x"].toDouble(),
-		        .offset_y = json_encoder["offset_y"].toDouble(),
-		        .codec = codec_id_from_string(json_encoder["codec"].toString("auto").toStdString()),
-		});
-	}
-
-	set_manualEncoders(true);
-	set_encoders(encoders);
+	m_jsonSettings.erase("encoder");
+	m_jsonSettings.erase("application");
+	m_jsonSettings.erase("hid-forwarding");
+	m_jsonSettings.erase("debug-gui");
+	m_jsonSettings.erase("use-steamvr-lh");
+	m_jsonSettings.erase("lh-stick-deadzone");
+	m_jsonSettings.erase("tcp-only");
+	m_jsonSettings.erase("application");
+	m_jsonSettings.erase("port");
+	m_jsonSettings.erase("hostname");
+	emitAllChanged();
 }
 
 bool Settings::flatpak() const
 {
 	return wivrn::is_flatpak();
+}
+
+int Settings::default_port() const
+{
+	return wivrn::default_port;
 }
 
 bool Settings::debug_gui() const
@@ -391,6 +624,27 @@ bool Settings::steamvr_lh() const
 #else
 	return false;
 #endif
+}
+bool Settings::hid_forwarding() const
+{
+	// only called from the UI thread → no locking needed
+	static std::optional<bool> can_open_uinput;
+	if (can_open_uinput.has_value())
+		return can_open_uinput.value();
+
+	can_open_uinput = false;
+	constexpr std::array paths = {"/dev/uinput", "/dev/input/uinput"};
+	for (const char * p: paths)
+	{
+		int fd = ::open(p, O_WRONLY | O_NONBLOCK);
+		if (fd >= 0)
+		{
+			::close(fd);
+			can_open_uinput = true;
+			break;
+		}
+	}
+	return can_open_uinput.value();
 }
 
 #include "moc_settings.cpp"

@@ -18,19 +18,21 @@
  */
 
 // must be included before vulkan_raii
-#include "vk/vk_helpers.h"
 
 #include "video_encoder_va.h"
 
 #include "encoder/encoder_settings.h"
 
+#include "os/os_time.h"
 #include "util/u_logging.h"
+#include "utils/wivrn_trace.h"
 #include "utils/wivrn_vk_bundle.h"
 
 #include <drm_fourcc.h>
 #include <filesystem>
 #include <libavutil/pixfmt.h>
 #include <optional>
+#include <unistd.h>
 #include <unordered_map>
 #include <vulkan/vulkan_raii.hpp>
 
@@ -42,6 +44,14 @@ extern "C"
 #include <libavutil/opt.h>
 #include <libavutil/pixdesc.h>
 }
+
+// Added in ffmpeg 6
+#ifndef AV_PROFILE_H264_CONSTRAINED_BASELINE
+#define AV_PROFILE_H264_CONSTRAINED_BASELINE FF_PROFILE_H264_CONSTRAINED_BASELINE
+#define AV_PROFILE_HEVC_MAIN_10 FF_PROFILE_HEVC_MAIN_10
+#define AV_PROFILE_HEVC_MAIN FF_PROFILE_HEVC_MAIN
+#define AV_PROFILE_AV1_MAIN FF_PROFILE_AV1_MAIN
+#endif
 
 namespace wivrn
 {
@@ -58,8 +68,9 @@ const char * encoder(video_codec codec)
 			return "hevc_vaapi";
 		case video_codec::av1:
 			return "av1_vaapi";
+		case video_codec::raw:
 		case video_codec::pyrowave:
-			throw std::runtime_error("pyrowave is only supported by the specific encoder");
+			break;
 	}
 	throw std::runtime_error("invalid codec " + std::to_string(int(codec)));
 }
@@ -146,15 +157,36 @@ vk::Format drm_to_vulkan_fmt(uint32_t drm_fourcc, int bit_depth)
 		return vulkan_drm_format_map.at(drm_fourcc);
 }
 
+vk::raii::CommandPool make_cmd_pool(wivrn::vk_bundle & vk, uint8_t stream_idx)
+{
+	auto res = vk.device.createCommandPool(vk::CommandPoolCreateInfo{
+
+	        .flags = vk::CommandPoolCreateFlagBits::eResetCommandBuffer | vk::CommandPoolCreateFlagBits::eTransient,
+	        .queueFamilyIndex = vk.queue.family_index,
+	});
+	vk.name(res, std::format("vaapi encoder {} command pool", stream_idx));
+	return res;
+}
+
 } // namespace
 
-video_encoder_va::video_encoder_va(wivrn_vk_bundle & vk,
-                                   wivrn::encoder_settings & settings,
-                                   float fps,
+video_encoder_va::video_encoder_va(wivrn::vk_bundle & vk,
+                                   const wivrn::encoder_settings & settings,
                                    uint8_t stream_idx) :
-        video_encoder_ffmpeg(stream_idx, settings.channels, settings.bitrate_multiplier),
-        synchronization2(vk.vk.features.synchronization_2)
+        video_encoder_ffmpeg(vk, stream_idx, settings),
+        vk{vk},
+        cmd_pool{make_cmd_pool(vk, stream_idx)}
 {
+	auto command_buffers = vk.device.allocateCommandBuffers(
+	        {.commandPool = *cmd_pool,
+	         .commandBufferCount = num_slots});
+	for (size_t i = 0; i < num_slots; ++i)
+	{
+		in[i].cmd = std::move(command_buffers[i]);
+		in[i].fence = vk::raii::Fence(vk.device,
+		                              vk::FenceCreateInfo{.flags = vk::FenceCreateFlagBits::eSignaled});
+	}
+
 	auto drm_hw_ctx = make_drm_hw_ctx(vk.physical_device, settings.device);
 	AVBufferRef * tmp;
 	int err = av_hwdevice_ctx_create_derived(&tmp,
@@ -164,9 +196,6 @@ video_encoder_va::video_encoder_va(wivrn_vk_bundle & vk,
 	if (err)
 		throw std::system_error(err, av_error_category(), "FFMPEG vaapi hardware context creation failed");
 	av_buffer_ptr vaapi_hw_ctx(tmp);
-
-	settings.video_width += settings.video_width % 2;
-	settings.video_height += settings.video_height % 2;
 
 	AVPixelFormat sw_format;
 
@@ -188,18 +217,8 @@ video_encoder_va::video_encoder_va(wivrn_vk_bundle & vk,
 			break;
 	}
 
-	auto vaapi_frame_ctx = make_hwframe_ctx(vaapi_hw_ctx.get(), AV_PIX_FMT_VAAPI, sw_format, settings.video_width, settings.video_height);
+	auto vaapi_frame_ctx = make_hwframe_ctx(vaapi_hw_ctx.get(), AV_PIX_FMT_VAAPI, sw_format, extent.width, extent.height);
 	assert(av_pix_fmt_count_planes(sw_format) == 2);
-
-	rect = vk::Rect2D{
-	        .offset = {
-	                .x = settings.offset_x,
-	                .y = settings.offset_y,
-	        },
-	        .extent = {
-	                .width = settings.width,
-	                .height = settings.height,
-	        }};
 
 	err = av_hwframe_ctx_create_derived(&tmp,
 	                                    AV_PIX_FMT_DRM_PRIME,
@@ -230,17 +249,19 @@ video_encoder_va::video_encoder_va(wivrn_vk_bundle & vk,
 	switch (settings.codec)
 	{
 		case video_codec::h264:
-			encoder_ctx->profile = FF_PROFILE_H264_CONSTRAINED_BASELINE;
+			encoder_ctx->profile = AV_PROFILE_H264_CONSTRAINED_BASELINE;
 			av_dict_set(&opts, "coder", "cavlc", 0);
 			av_dict_set(&opts, "rc_mode", "CBR", 0);
 			break;
 		case video_codec::h265:
 			// bit_depth is either 8 or 10 here
-			encoder_ctx->profile = settings.bit_depth == 10 ? FF_PROFILE_HEVC_MAIN_10 : FF_PROFILE_HEVC_MAIN;
+			encoder_ctx->profile = settings.bit_depth == 10 ? AV_PROFILE_HEVC_MAIN_10 : AV_PROFILE_HEVC_MAIN;
 			break;
 		case video_codec::av1:
-			encoder_ctx->profile = FF_PROFILE_AV1_MAIN;
+			encoder_ctx->profile = AV_PROFILE_AV1_MAIN;
 			break;
+		case video_codec::raw:
+			throw std::runtime_error("raw codec not supported");
 		case video_codec::pyrowave:
 			throw std::runtime_error("pyrowave is only supported by the specific encoder");
 	}
@@ -249,11 +270,11 @@ video_encoder_va::video_encoder_va(wivrn_vk_bundle & vk,
 		av_dict_set(&opts, option.first.c_str(), option.second.c_str(), 0);
 	}
 
-	encoder_ctx->width = settings.video_width;
-	encoder_ctx->height = settings.video_height;
+	encoder_ctx->width = extent.width;
+	encoder_ctx->height = extent.height;
 	encoder_ctx->time_base = {std::chrono::steady_clock::duration::period::num,
 	                          std::chrono::steady_clock::duration::period::den};
-	encoder_ctx->framerate = AVRational{(int)fps, 1};
+	encoder_ctx->framerate = AVRational{(int)settings.fps * 1000, 1000};
 	encoder_ctx->sample_aspect_ratio = AVRational{1, 1};
 	encoder_ctx->pix_fmt = AV_PIX_FMT_VAAPI;
 	encoder_ctx->color_range = AVCOL_RANGE_JPEG;
@@ -414,10 +435,18 @@ video_encoder_va::video_encoder_va(wivrn_vk_bundle & vk,
 			vk.device.bindImageMemory2(bind_info);
 		}
 	}
+
+	ts_pool = gpu_timestamp_pool(vk, vk.queue.family_index, num_slots, std::format("va encoder {} pixel copy", stream_idx));
 }
 
-std::pair<bool, vk::Semaphore> video_encoder_va::present_image(vk::Image y_cbcr, vk::raii::CommandBuffer & cmd_buf, uint8_t slot, uint64_t frame_index)
+void video_encoder_va::present_image(vk::Image y_cbcr, vk::SemaphoreSubmitInfo, uint8_t slot, uint64_t frame_index)
 {
+	if (vk.device.waitForFences(*in[slot].fence, true, 1'000'000'000) == vk::Result::eTimeout)
+	{
+		U_LOG_E("Timeout on stream %d", stream_idx);
+		return;
+	}
+
 	std::array im_barriers = {
 	        vk::ImageMemoryBarrier{
 	                .srcAccessMask = vk::AccessFlagBits::eNone,
@@ -442,7 +471,13 @@ std::pair<bool, vk::Semaphore> video_encoder_va::present_image(vk::Image y_cbcr,
 	                                     .layerCount = 1},
 	        },
 	};
-	cmd_buf.pipelineBarrier(
+
+	auto & cmd = in[slot].cmd;
+	cmd.begin({.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit});
+
+	ts_pool.cmd_begin(cmd, slot, frame_index, vk::PipelineStageFlagBits2::eTopOfPipe);
+
+	cmd.pipelineBarrier(
 	        vk::PipelineStageFlagBits::eAllCommands,
 	        vk::PipelineStageFlagBits::eTransfer,
 	        {},
@@ -450,7 +485,7 @@ std::pair<bool, vk::Semaphore> video_encoder_va::present_image(vk::Image y_cbcr,
 	        nullptr,
 	        im_barriers);
 
-	cmd_buf.copyImage(
+	cmd.copyImage(
 	        y_cbcr,
 	        vk::ImageLayout::eGeneral,
 	        *in[slot].luma,
@@ -458,24 +493,20 @@ std::pair<bool, vk::Semaphore> video_encoder_va::present_image(vk::Image y_cbcr,
 	        vk::ImageCopy{
 	                .srcSubresource = {
 	                        .aspectMask = vk::ImageAspectFlagBits::ePlane0,
-	                        .baseArrayLayer = uint32_t(channels),
+	                        .baseArrayLayer = stream_idx,
 	                        .layerCount = 1,
-	                },
-	                .srcOffset = {
-	                        .x = rect.offset.x,
-	                        .y = rect.offset.y,
 	                },
 	                .dstSubresource = {
 	                        .aspectMask = vk::ImageAspectFlagBits::eColor,
 	                        .layerCount = 1,
 	                },
 	                .extent = {
-	                        .width = rect.extent.width,
-	                        .height = rect.extent.height,
+	                        .width = extent.width,
+	                        .height = extent.height,
 	                        .depth = 1,
 	                }});
 
-	cmd_buf.copyImage(
+	cmd.copyImage(
 	        y_cbcr,
 	        vk::ImageLayout::eGeneral,
 	        *in[slot].chroma,
@@ -483,20 +514,16 @@ std::pair<bool, vk::Semaphore> video_encoder_va::present_image(vk::Image y_cbcr,
 	        vk::ImageCopy{
 	                .srcSubresource = {
 	                        .aspectMask = vk::ImageAspectFlagBits::ePlane1,
-	                        .baseArrayLayer = uint32_t(channels),
+	                        .baseArrayLayer = stream_idx,
 	                        .layerCount = 1,
-	                },
-	                .srcOffset = {
-	                        .x = rect.offset.x / 2,
-	                        .y = rect.offset.y / 2,
 	                },
 	                .dstSubresource = {
 	                        .aspectMask = vk::ImageAspectFlagBits::eColor,
 	                        .layerCount = 1,
 	                },
 	                .extent = {
-	                        .width = rect.extent.width / 2,
-	                        .height = rect.extent.height / 2,
+	                        .width = extent.width / 2,
+	                        .height = extent.height / 2,
 	                        .depth = 1,
 	                }});
 
@@ -508,21 +535,48 @@ std::pair<bool, vk::Semaphore> video_encoder_va::present_image(vk::Image y_cbcr,
 		b.newLayout = vk::ImageLayout::eGeneral;
 	}
 
-	cmd_buf.pipelineBarrier(
+	cmd.pipelineBarrier(
 	        vk::PipelineStageFlagBits::eTransfer,
-	        synchronization2 ? vk::PipelineStageFlagBits::eNone : vk::PipelineStageFlagBits::eAllCommands,
+	        vk::PipelineStageFlagBits::eNone,
 	        {},
 	        nullptr,
 	        nullptr,
 	        im_barriers);
-	return {false, nullptr};
+
+	ts_pool.cmd_end(cmd, slot, vk::PipelineStageFlagBits2::eAllTransfer);
+
+	cmd.end();
+
+	std::unique_lock lock(vk.queue.mutex);
+	vk::CommandBufferSubmitInfo cmd_info{
+	        .commandBuffer = *cmd,
+	};
+
+	vk.device.resetFences(*in[slot].fence);
+	vk.queue.queue.submit2(vk::SubmitInfo2{
+	                               .commandBufferInfoCount = 1,
+	                               .pCommandBufferInfos = &cmd_info,
+	                       },
+	                       *in[slot].fence);
 }
 
-void video_encoder_va::push_frame(bool idr, std::chrono::steady_clock::time_point pts, uint8_t slot)
+void video_encoder_va::push_frame(bool idr, uint8_t slot)
 {
+	if (vk.device.waitForFences(*in[slot].fence, true, 1'000'000'000) == vk::Result::eTimeout)
+		throw std::runtime_error("timeout");
+
+	if (auto s = ts_pool.collect(slot))
+	{
+		wivrn::trace::gpu_slice(wivrn::trace::gpu_track::va_copy,
+		                        "vk_copy_luma_chroma",
+		                        s->begin_ns,
+		                        s->end_ns,
+		                        s->frame_index,
+		                        stream_idx);
+	}
+
 	auto & va_frame = in[slot].va_frame;
 	va_frame->pict_type = idr ? AV_PICTURE_TYPE_I : AV_PICTURE_TYPE_P;
-	va_frame->pts = pts.time_since_epoch().count();
 	int err = avcodec_send_frame(encoder_ctx.get(), va_frame.get());
 	if (err)
 	{
