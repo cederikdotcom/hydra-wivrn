@@ -148,8 +148,16 @@ void video_encoder_pyrowave::present_image(vk::Image y_cbcr, vk::SemaphoreSubmit
 	auto it = image_views.find(VkImage(y_cbcr));
 	if (it == image_views.end())
 	{
+		// The image also carries storage and, for the vulkan encoder, video
+		// encode usage. Neither is valid on a single plane view, so restrict
+		// these views to what pyrowave actually does with them.
+		const vk::ImageViewUsageCreateInfo view_usage{
+		        .usage = vk::ImageUsageFlagBits::eSampled,
+		};
+
 		auto y = vk.device.createImageView(
 		        vk::ImageViewCreateInfo{
+		                .pNext = &view_usage,
 		                .image = y_cbcr,
 		                .viewType = vk::ImageViewType::e2D,
 		                .format = vk::Format::eR8Unorm,
@@ -161,6 +169,7 @@ void video_encoder_pyrowave::present_image(vk::Image y_cbcr, vk::SemaphoreSubmit
 		                }});
 		auto cb = vk.device.createImageView(
 		        vk::ImageViewCreateInfo{
+		                .pNext = &view_usage,
 		                .image = y_cbcr,
 		                .viewType = vk::ImageViewType::e2D,
 		                .format = vk::Format::eR8G8Unorm,
@@ -172,6 +181,7 @@ void video_encoder_pyrowave::present_image(vk::Image y_cbcr, vk::SemaphoreSubmit
 		                }});
 		auto cr = vk.device.createImageView(
 		        vk::ImageViewCreateInfo{
+		                .pNext = &view_usage,
 		                .image = y_cbcr,
 		                .viewType = vk::ImageViewType::e2D,
 		                .format = vk::Format::eR8G8Unorm,
