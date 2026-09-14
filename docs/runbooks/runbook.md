@@ -70,18 +70,37 @@ in the server configuration (`~/.config/wivrn/config.json`):
 
 ```json
 {
-  "encoders": [
-    {
-      "encoder": "pyrowave",
-      "codec": "pyrowave"
-    }
-  ]
+  "encoder": [
+    {"encoder": "pyrowave", "codec": "pyrowave"},
+    {"encoder": "pyrowave", "codec": "pyrowave"},
+    {}
+  ],
+  "application": ["/bin/sh", "-c", "sleep infinity | exec /opt/experiencenet/hellohydra_xr/hellohydra_xr -g Vulkan"]
 }
 ```
 
-The bitrate setting is honored, but sizing below ~200 Mbit/s defeats the
-codec. There is no alpha-stream support; do not assign pyrowave to the alpha
-(third) encoder slot.
+Three things here are easy to get wrong, and all three cost time already:
+
+- The key is **`encoder`, singular**. A plural `encoders` is silently ignored
+  and the server streams its default codec while looking healthy. Always
+  confirm against the `print_encoders` block in the server log.
+- The three entries are left eye, right eye, alpha. **PyroWave cannot encode
+  the alpha stream**, so leave the third entry `{}` for the default encoder.
+- **Bitrate is a client setting.** There is no server-side bitrate key. Set it
+  in the headset app; below ~200 Mbit/s defeats the codec.
+
+The `application` entry is piped from `sleep infinity` because hello_xr polls
+stdin and exits at once when stdin is EOF under systemd, which presents as the
+headset waiting forever for an application.
+
+Confirm the codec actually engaged by reading the server log:
+
+```
+INFO [print_encoders] Encoder configuration:
+	* pyrowave (pyrowave 8-bit)   size: 960x1024   bitrate: 98.7Mbit/s
+	* pyrowave (pyrowave 8-bit)   size: 960x1024   bitrate: 98.7Mbit/s
+	* vulkan (h265 8-bit)         size: 960x512
+```
 
 ## Hardware requirements
 
@@ -107,7 +126,38 @@ codec. There is no alpha-stream support; do not assign pyrowave to the alpha
 
 ## Status
 
-The `pyrowave` branch is a port of the maintainer prototype onto 2026
-upstream, verified by CI build only. It has not yet streamed to a headset.
-Before venue use: build both sides, stream to a Quest 3 on a 6 GHz AP, and
-measure decode time and battery draw against the H.265 baseline.
+**Streaming, validated 2026-09-14.** Omarchy server (msi1060, GTX 1060) to a
+Quest 2: both eyes pyrowave 8-bit at 98.7 Mbit/s, rendering real content over
+WiFi. Merged to this fork's `master`.
+
+Two bugs were fixed to get there, both recorded on issues.experiencenet.com:
+the x50 bitrate weight starved the alpha stream (#726), and the compositor
+image was not created sampleable, so the encoder emitted a wavelet encode of a
+blank image and the headset showed solid green (#727).
+
+Still open:
+
+- **#728**: pyrowave's shader device features (16-bit and 8-bit storage,
+  subgroup size control) are not enabled on the compositor device. NVIDIA
+  tolerates it; verify before running on an AMD or Intel host.
+- No performance measurement yet. msi1060 is on WiFi rather than ethernet, and
+  a Quest 2 is below the intended target. For real numbers: wire the server,
+  use a Quest 3 on a dedicated 6 GHz AP, and compare frame time and battery
+  against the H.265 baseline.
+
+## Debugging a blank or wrong image
+
+Two techniques that did the work here, in order of cost:
+
+1. **Split the eyes between codecs.** Set the left eye to pyrowave and the
+   right to `{"encoder": "vulkan", "codec": "h265"}`. One connect then tells
+   you whether the fault is the codec path or the rig, because you see both at
+   once.
+2. **Dump the bitstream.** Start the server with `WIVRN_DUMP_VIDEO=/var/tmp/dump`
+   and inspect the entropy of `dump-0.pyro`. Real compressed video uses most of
+   the 256 byte values; a broken encode was 99.7% four values in a repeating
+   pattern, which proved the encoder rather than the decoder was at fault
+   without needing the headset again.
+3. **Vulkan validation on the server.** Install `vulkan-validation-layers` and
+   set `VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation`. This named #727
+   outright.
