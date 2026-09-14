@@ -1,0 +1,42 @@
+# Maintainer: Cederik <cederik@cederik.com>
+# WiVRn server with the PyroWave codec, built from the pyrowave branch of
+# the hydra-wivrn fork. Targets Omarchy (Arch). Client side is the Quest
+# APK from the fork's CI; this package is the server only.
+pkgname=hydra-wivrn-server
+pkgver=26.6.pyrowave
+pkgrel=1
+pkgdesc="OpenXR wireless PCVR streaming server with the PyroWave wavelet codec"
+arch=(x86_64)
+url="https://github.com/cederikdotcom/hydra-wivrn"
+license=(GPL3)
+depends=(avahi boost-libs eigen ffmpeg libpulse nlohmann-json openxr
+         vulkan-icd-loader x264)
+makedepends=(boost cli11 cmake git glib2-devel glslang ninja nasm pkgconf
+             python spirv-tools vulkan-headers)
+provides=(wivrn-server)
+conflicts=(wivrn-server)
+source=("git+https://github.com/cederikdotcom/hydra-wivrn.git#branch=pyrowave")
+sha256sums=('SKIP')
+
+pkgver() {
+  cd hydra-wivrn
+  printf '%s.pyrowave.r%s.%s' \
+    "$(grep -Po 'project\(WiVRn VERSION \K[0-9.]+' CMakeLists.txt || echo 0)" \
+    "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
+}
+
+build() {
+  cmake -S hydra-wivrn -B build -GNinja \
+    -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+    -DCMAKE_INSTALL_PREFIX=/usr \
+    -DWIVRN_BUILD_SERVER=ON \
+    -DWIVRN_BUILD_CLIENT=OFF \
+    -DWIVRN_BUILD_DASHBOARD=OFF \
+    -DWIVRN_BUILD_DISSECTOR=OFF \
+    -DWIVRN_USE_NVENC=OFF
+  cmake --build build
+}
+
+package() {
+  DESTDIR="$pkgdir" cmake --install build
+}

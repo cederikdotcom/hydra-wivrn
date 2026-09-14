@@ -114,6 +114,7 @@ if (WIVRN_BUILD_SERVER)
 			encoder/encoder_settings.cpp
 			encoder/idr_handler.cpp
 			encoder/video_encoder.cpp
+			encoder/video_encoder_pyrowave.cpp
 			encoder/video_encoder_raw.cpp
 
 			driver/app_pacer.cpp
@@ -147,7 +148,7 @@ if (WIVRN_BUILD_SERVER)
 	target_include_directories(wivrn-server SYSTEM PRIVATE ${monado_SOURCE_DIR}/src/xrt/compositor/)
 	target_include_directories(wivrn-server PRIVATE .)
 
-	target_link_libraries(wivrn-server PRIVATE CLI11::CLI11 xrt-external-renderdoc)
+	target_link_libraries(wivrn-server PRIVATE CLI11::CLI11 pyrowave xrt-external-renderdoc)
 
 	if (WIVRN_FEATURE_STEAMVR_LIGHTHOUSE)
 		target_include_directories(wivrn-server SYSTEM PRIVATE ${monado_SOURCE_DIR}/src/xrt/drivers/steamvr_lh/)

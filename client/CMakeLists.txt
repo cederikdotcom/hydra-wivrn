@@ -127,6 +127,7 @@ target_compile_definitions(wivrn PRIVATE "XR_USE_TIMESPEC=1")
 file(GLOB LOCAL_SOURCE CONFIGURE_DEPENDS
     "*.cpp"
     "decoder/*.cpp"
+    "decoder/pyrowave/*.cpp"
     "scenes/*.cpp"
     "utils/*.cpp"
     "vk/*.cpp"
@@ -155,6 +156,7 @@ target_link_libraries(wivrn
     Vulkan::Vulkan
     wivrn-common
     wivrn-external
+    pyrowave
 )
 
 target_compile_definitions(wivrn PRIVATE -DXR_USE_GRAPHICS_API_VULKAN)

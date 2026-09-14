@@ -1,0 +1,433 @@
+From aeae853dcdbfea51cbdfd502d9b0aaa818ed09a0 Mon Sep 17 00:00:00 2001
+From: Patrick Nicolas <patricknicolas@laposte.net>
+Date: Wed, 9 Sep 2026 23:39:47 +0000
+Subject: [PATCH] a/vk: expose 16bit storage, float16/int8, subgroup size
+ control, maintenance4 and shaderInt16 features
+
+Squash of the WiVRn proto/pyrowave Monado patch series (9901-9910),
+reimplemented against monado f037264d. Needed by the PyroWave codec:
+the compositor device must enable these features for the encoder's
+compute shaders.
+---
+ src/xrt/auxiliary/vk/vk_bundle_init.c         | 154 +++++++++++++++++-
+ src/xrt/auxiliary/vk/vk_generate_inc_files.py |  11 +-
+ src/xrt/auxiliary/vk/vk_helpers.h             |   7 +
+ src/xrt/compositor/main/comp_compositor.c     |   1 +
+ src/xrt/compositor/util/comp_vulkan.c         |   7 +
+ src/xrt/compositor/util/comp_vulkan.h         |   3 +
+ 6 files changed, 177 insertions(+), 6 deletions(-)
+
+diff --git a/src/xrt/auxiliary/vk/vk_bundle_init.c b/src/xrt/auxiliary/vk/vk_bundle_init.c
+index d20d2f3..8fd1bda 100644
+--- a/src/xrt/auxiliary/vk/vk_bundle_init.c
++++ b/src/xrt/auxiliary/vk/vk_bundle_init.c
+@@ -590,6 +590,13 @@ filter_device_features(struct vk_bundle *vk,
+ 	};
+ #endif
+ 
++#ifdef VK_KHR_maintenance4
++	VkPhysicalDeviceMaintenance4FeaturesKHR maintenance4 = {
++	    .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_4_FEATURES_KHR,
++	    .pNext = NULL,
++	};
++#endif
++
+ #ifdef VK_KHR_8bit_storage
+ 	VkPhysicalDevice8BitStorageFeaturesKHR storage_8bit = {
+ 	    .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_8BIT_STORAGE_FEATURES_KHR,
+@@ -597,6 +604,13 @@ filter_device_features(struct vk_bundle *vk,
+ 	};
+ #endif
+ 
++#ifdef VK_KHR_16bit_storage
++	VkPhysicalDevice16BitStorageFeaturesKHR storage_16bit = {
++	    .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES_KHR,
++	    .pNext = NULL,
++	};
++#endif
++
+ #ifdef VK_KHR_timeline_semaphore
+ 	VkPhysicalDeviceTimelineSemaphoreFeaturesKHR timeline_semaphore_info = {
+ 	    .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES_KHR,
+@@ -649,6 +663,20 @@ filter_device_features(struct vk_bundle *vk,
+ 	};
+ #endif
+ 
++#ifdef VK_KHR_shader_float16_int8
++	VkPhysicalDeviceShaderFloat16Int8FeaturesKHR shader_float16_int8 = {
++	    .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES_KHR,
++	    .pNext = NULL,
++	};
++#endif
++
++#ifdef VK_EXT_subgroup_size_control
++	VkPhysicalDeviceSubgroupSizeControlFeaturesEXT subgroup_size_control = {
++	    .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES_EXT,
++	    .pNext = NULL,
++	};
++#endif
++
+ 	VkPhysicalDeviceFeatures2 physical_device_features = {
+ 	    .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+ 	    .pNext = NULL,
+@@ -661,6 +689,13 @@ filter_device_features(struct vk_bundle *vk,
+ 	}
+ #endif
+ 
++#ifdef VK_KHR_maintenance4
++	if (vk->has_KHR_maintenance4) {
++		vk_append_to_pnext_chain((VkBaseInStructure *)&physical_device_features,
++		                         (VkBaseInStructure *)&maintenance4);
++	}
++#endif
++
+ #ifdef VK_KHR_8bit_storage
+ 	if (vk->has_KHR_8bit_storage) {
+ 		vk_append_to_pnext_chain((VkBaseInStructure *)&physical_device_features,
+@@ -668,6 +703,13 @@ filter_device_features(struct vk_bundle *vk,
+ 	}
+ #endif
+ 
++#ifdef VK_KHR_16bit_storage
++	if (vk->has_KHR_16bit_storage) {
++		vk_append_to_pnext_chain((VkBaseInStructure *)&physical_device_features,
++		                         (VkBaseInStructure *)&storage_16bit);
++	}
++#endif
++
+ #ifdef VK_KHR_timeline_semaphore
+ 	if (vk->has_KHR_timeline_semaphore) {
+ 		vk_append_to_pnext_chain((VkBaseInStructure *)&physical_device_features,
+@@ -716,6 +758,20 @@ filter_device_features(struct vk_bundle *vk,
+ 	}
+ #endif
+ 
++#ifdef VK_KHR_shader_float16_int8
++	if (vk->has_KHR_shader_float16_int8) {
++		vk_append_to_pnext_chain((VkBaseInStructure *)&physical_device_features,
++		                         (VkBaseInStructure *)&shader_float16_int8);
++	}
++#endif
++
++#ifdef VK_EXT_subgroup_size_control
++	if (vk->has_EXT_subgroup_size_control) {
++		vk_append_to_pnext_chain((VkBaseInStructure *)&physical_device_features,
++		                         (VkBaseInStructure *)&subgroup_size_control);
++	}
++#endif
++
+ 	vk->vkGetPhysicalDeviceFeatures2( //
+ 	    physical_device,              // physicalDevice
+ 	    &physical_device_features);   // pFeatures
+@@ -731,10 +787,18 @@ filter_device_features(struct vk_bundle *vk,
+ 	CHECK(null_descriptor, robust_info.nullDescriptor);
+ #endif
+ 
++#ifdef VK_KHR_maintenance4
++	CHECK(maintenance4, maintenance4.maintenance4);
++#endif
++
+ #ifdef VK_KHR_8bit_storage
+ 	CHECK(storage_buffer_8bit_access, storage_8bit.storageBuffer8BitAccess);
+ #endif
+ 
++#ifdef VK_KHR_16bit_storage
++	CHECK(storage_buffer_16bit_access, storage_16bit.storageBuffer16BitAccess);
++#endif
++
+ #ifdef VK_KHR_timeline_semaphore
+ 	CHECK(timeline_semaphore, timeline_semaphore_info.timelineSemaphore);
+ #endif
+@@ -768,7 +832,18 @@ filter_device_features(struct vk_bundle *vk,
+ 	CHECK(ext_fmt_resolve, ext_fmt_resolve_info.externalFormatResolve);
+ #endif
+ 
++#ifdef VK_KHR_shader_float16_int8
++	CHECK(shader_float16, shader_float16_int8.shaderFloat16);
++	CHECK(shader_int8, shader_float16_int8.shaderInt8);
++#endif
++
++#ifdef VK_EXT_subgroup_size_control
++	CHECK(subgroup_size_control, subgroup_size_control.subgroupSizeControl);
++	CHECK(compute_full_subgroups, subgroup_size_control.computeFullSubgroups);
++#endif
++
+ 	CHECK(shader_image_gather_extended, physical_device_features.features.shaderImageGatherExtended);
++	CHECK(shader_int16, physical_device_features.features.shaderInt16);
+ 
+ 	CHECK(shader_storage_image_write_without_format,
+ 	      physical_device_features.features.shaderStorageImageWriteWithoutFormat);
+@@ -784,20 +859,34 @@ filter_device_features(struct vk_bundle *vk,
+ 	         "\n\tpresnet_wait2: %i"
+ 	         "\n\tshader_image_gather_extended: %i"
+ 	         "\n\tshader_storage_image_write_without_format: %i"
++	         "\n\tshader_float16: %i"
++	         "\n\tshader_int8: %i"
++	         "\n\tshader_int16: %i"
+ 	         "\n\tstorage_buffer_8bit_access: %i"
++	         "\n\tstorage_buffer_16bit_access: %i"
+ 	         "\n\tsynchronization_2: %i"
+ 	         "\n\ttimeline_semaphore: %i"
+-	         "\n\tvideo_maintenance_1: %i",                              //
++	         "\n\tvideo_maintenance_1: %i"
++	         "\n\tsubgroup_size_control: %i"
++	         "\n\tcompute_full_subgroups: %i"
++	         "\n\tmaintenance4: %i",                                     //
+ 	         device_features->ext_fmt_resolve,                           //
+ 	         device_features->null_descriptor,                           //
+ 	         device_features->present_wait,                              //
+ 	         device_features->present_wait2,                             //
+ 	         device_features->shader_image_gather_extended,              //
+ 	         device_features->shader_storage_image_write_without_format, //
++	         device_features->shader_float16,                            //
++	         device_features->shader_int8,                               //
++	         device_features->shader_int16,                              //
+ 	         device_features->storage_buffer_8bit_access,                //
++	         device_features->storage_buffer_16bit_access,               //
+ 	         device_features->synchronization_2,                         //
+ 	         device_features->timeline_semaphore,                        //
+-	         device_features->video_maintenance_1);                      //
++	         device_features->video_maintenance_1,                       //
++	         device_features->subgroup_size_control,                     //
++	         device_features->compute_full_subgroups,                    //
++	         device_features->maintenance4);                             //
+ }
+ 
+ static inline void
+@@ -1003,6 +1092,14 @@ vk_create_device(struct vk_bundle *vk,
+ 	};
+ #endif
+ 
++#ifdef VK_KHR_maintenance4
++	VkPhysicalDeviceMaintenance4FeaturesKHR maintenance4 = {
++	    .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_4_FEATURES_KHR,
++	    .pNext = NULL,
++	    .maintenance4 = device_features.maintenance4,
++	};
++#endif
++
+ #ifdef VK_KHR_8bit_storage
+ 	VkPhysicalDevice8BitStorageFeaturesKHR storage_8bit = {
+ 	    .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_8BIT_STORAGE_FEATURES_KHR,
+@@ -1011,6 +1108,14 @@ vk_create_device(struct vk_bundle *vk,
+ 	};
+ #endif
+ 
++#ifdef VK_KHR_16bit_storage
++	VkPhysicalDevice16BitStorageFeaturesKHR storage_16bit = {
++	    .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES_KHR,
++	    .pNext = NULL,
++	    .storageBuffer16BitAccess = device_features.storage_buffer_16bit_access,
++	};
++#endif
++
+ #if VK_KHR_present_wait
+ 	VkPhysicalDevicePresentWaitFeaturesKHR present_wait = {
+ 	    .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_WAIT_FEATURES_KHR,
+@@ -1075,8 +1180,27 @@ vk_create_device(struct vk_bundle *vk,
+ 	};
+ #endif
+ 
++#ifdef VK_KHR_shader_float16_int8
++	VkPhysicalDeviceShaderFloat16Int8FeaturesKHR shader_float16_int8 = {
++	    .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES_KHR,
++	    .pNext = NULL,
++	    .shaderFloat16 = device_features.shader_float16,
++	    .shaderInt8 = device_features.shader_int8,
++	};
++#endif
++
++#ifdef VK_EXT_subgroup_size_control
++	VkPhysicalDeviceSubgroupSizeControlFeaturesEXT subgroup_size_control = {
++	    .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES_EXT,
++	    .pNext = NULL,
++	    .subgroupSizeControl = device_features.subgroup_size_control,
++	    .computeFullSubgroups = device_features.compute_full_subgroups,
++	};
++#endif
++
+ 	VkPhysicalDeviceFeatures enabled_features = {
+ 	    .shaderImageGatherExtended = device_features.shader_image_gather_extended,
++	    .shaderInt16 = device_features.shader_int16,
+ 	    .shaderStorageImageWriteWithoutFormat = device_features.shader_storage_image_write_without_format,
+ 	};
+ 
+@@ -1095,12 +1219,24 @@ vk_create_device(struct vk_bundle *vk,
+ 	}
+ #endif
+ 
++#ifdef VK_KHR_maintenance4
++	if (vk->has_KHR_maintenance4) {
++		vk_append_to_pnext_chain((VkBaseInStructure *)&device_create_info, (VkBaseInStructure *)&maintenance4);
++	}
++#endif
++
+ #ifdef VK_KHR_8bit_storage
+ 	if (vk->has_KHR_8bit_storage) {
+ 		vk_append_to_pnext_chain((VkBaseInStructure *)&device_create_info, (VkBaseInStructure *)&storage_8bit);
+ 	}
+ #endif
+ 
++#ifdef VK_KHR_16bit_storage
++	if (vk->has_KHR_16bit_storage) {
++		vk_append_to_pnext_chain((VkBaseInStructure *)&device_create_info, (VkBaseInStructure *)&storage_16bit);
++	}
++#endif
++
+ #ifdef VK_KHR_present_id
+ 	if (vk->has_KHR_present_id && device_features.present_wait) {
+ 		vk_append_to_pnext_chain((VkBaseInStructure *)&device_create_info, (VkBaseInStructure *)&present_id);
+@@ -1153,6 +1289,20 @@ vk_create_device(struct vk_bundle *vk,
+ 	}
+ #endif
+ 
++#ifdef VK_KHR_shader_float16_int8
++	if (vk->has_KHR_shader_float16_int8) {
++		vk_append_to_pnext_chain((VkBaseInStructure *)&device_create_info,
++		                         (VkBaseInStructure *)&shader_float16_int8);
++	}
++#endif
++
++#ifdef VK_EXT_subgroup_size_control
++	if (vk->has_EXT_subgroup_size_control) {
++		vk_append_to_pnext_chain((VkBaseInStructure *)&device_create_info,
++		                         (VkBaseInStructure *)&subgroup_size_control);
++	}
++#endif
++
+ 	ret = vk->vkCreateDevice(vk->physical_device, &device_create_info, NULL, &vk->device);
+ 
+ 	// Destroy the list now.
+diff --git a/src/xrt/auxiliary/vk/vk_generate_inc_files.py b/src/xrt/auxiliary/vk/vk_generate_inc_files.py
+index a75572c..5f417a9 100644
+--- a/src/xrt/auxiliary/vk/vk_generate_inc_files.py
++++ b/src/xrt/auxiliary/vk/vk_generate_inc_files.py
+@@ -5,6 +5,7 @@
+ """Simple script to generate vk_*.h.inc and vk_*.c.inc files."""
+ 
+ import argparse
++import re
+ from typing import Callable, Iterable, List, Optional
+ 
+ 
+@@ -312,6 +313,7 @@ INSTANCE_EXTENSIONS_TO_CHECK = [
+ # Sorted KHR, EXT, Vendor, internally alphabetically
+ DEVICE_EXTENSIONS_TO_CHECK = [
+     "VK_KHR_8bit_storage",
++    "VK_KHR_16bit_storage",
+     "VK_KHR_calibrated_timestamps",
+     "VK_KHR_external_fence_fd",
+     "VK_KHR_external_memory",
+@@ -328,6 +330,7 @@ DEVICE_EXTENSIONS_TO_CHECK = [
+     "VK_KHR_present_wait",
+     "VK_KHR_present_wait2",
+     "VK_KHR_portability_subset",
++    "VK_KHR_shader_float16_int8",
+     "VK_KHR_shared_presentable_image",
+     "VK_KHR_synchronization2",
+     "VK_KHR_timeline_semaphore",
+@@ -340,6 +343,7 @@ DEVICE_EXTENSIONS_TO_CHECK = [
+     "VK_EXT_image_drm_format_modifier",
+     "VK_EXT_metal_objects",
+     "VK_EXT_robustness2",
++    "VK_EXT_subgroup_size_control",
+     "VK_ANDROID_external_format_resolve",
+     "VK_GOOGLE_display_timing",
+ ]
+@@ -463,10 +467,9 @@ def make_ext_member_name(ext: str):
+ 
+ def make_ext_name_define(ext: str):
+     str = ext.upper()
+-    str = str.replace("1", "_1")
+-    str = str.replace("2", "_2")
+-    str = str.replace("3", "_3")
+-    str = str.replace("4", "_4")
++    # A number suffix shall be prefixed with "_",
++    # but 16BIT and INT8 must remain one word.
++    str = re.sub("([0-7]+$)", r"_\1", str)
+ 
+     return "{}_EXTENSION_NAME".format(str)
+ 
+diff --git a/src/xrt/auxiliary/vk/vk_helpers.h b/src/xrt/auxiliary/vk/vk_helpers.h
+index f14b2dd..cdee7c4 100644
+--- a/src/xrt/auxiliary/vk/vk_helpers.h
++++ b/src/xrt/auxiliary/vk/vk_helpers.h
+@@ -768,16 +768,23 @@ struct vk_device_features
+ {
+ 	bool shader_image_gather_extended;
+ 	bool shader_storage_image_write_without_format;
++	bool shader_float16;
++	bool shader_int8;
++	bool shader_int16;
+ 	bool null_descriptor;
+ 	bool timeline_semaphore;
+ 	bool synchronization_2;
+ 	bool ext_fmt_resolve;
+ 	bool storage_buffer_8bit_access;
++	bool storage_buffer_16bit_access;
+ 	bool present_id;
+ 	bool present_id2;
+ 	bool present_wait;
+ 	bool present_wait2;
+ 	bool video_maintenance_1;
++	bool subgroup_size_control;
++	bool compute_full_subgroups;
++	bool maintenance4;
+ };
+ 
+ /*!
+diff --git a/src/xrt/compositor/main/comp_compositor.c b/src/xrt/compositor/main/comp_compositor.c
+index a8fbd01..a9c18c4 100644
+--- a/src/xrt/compositor/main/comp_compositor.c
++++ b/src/xrt/compositor/main/comp_compositor.c
+@@ -767,6 +767,7 @@ compositor_init_vulkan(struct comp_compositor *c)
+ 	    .selected_gpu_index = c->settings.selected_gpu_index,
+ 	    .client_gpu_index = c->settings.client_gpu_index,
+ 	    .timeline_semaphore = true, // Flag is optional, not a hard requirement.
++	    .shader_int16 = true,
+ 	};
+ 
+ 	struct comp_vulkan_results vk_res = {0};
+diff --git a/src/xrt/compositor/util/comp_vulkan.c b/src/xrt/compositor/util/comp_vulkan.c
+index 42c612f..6156b12 100644
+--- a/src/xrt/compositor/util/comp_vulkan.c
++++ b/src/xrt/compositor/util/comp_vulkan.c
+@@ -272,7 +272,11 @@ create_device(struct vk_bundle *vk, const struct comp_vulkan_arguments *vk_args)
+ 	struct vk_device_features device_features = {
+ 	    .shader_image_gather_extended = true,
+ 	    .shader_storage_image_write_without_format = true,
++	    .shader_float16 = true,
++	    .shader_int8 = true,
++	    .shader_int16 = vk_args->shader_int16,
+ 	    .storage_buffer_8bit_access = true,
++	    .storage_buffer_16bit_access = true,
+ 	    .null_descriptor = only_compute_queue,
+ 	    .timeline_semaphore = vk_args->timeline_semaphore,
+ 	    .synchronization_2 = true,
+@@ -281,6 +285,9 @@ create_device(struct vk_bundle *vk, const struct comp_vulkan_arguments *vk_args)
+ 	    .present_wait = true,
+ 	    .present_wait2 = true,
+ 	    .video_maintenance_1 = true,
++	    .subgroup_size_control = true,
++	    .compute_full_subgroups = true,
++	    .maintenance4 = true,
+ 	};
+ 
+ 	ret = vk_init_mutex(vk);
+diff --git a/src/xrt/compositor/util/comp_vulkan.h b/src/xrt/compositor/util/comp_vulkan.h
+index 6dad09b..2763800 100644
+--- a/src/xrt/compositor/util/comp_vulkan.h
++++ b/src/xrt/compositor/util/comp_vulkan.h
+@@ -56,6 +56,9 @@ struct comp_vulkan_arguments
+ 	//! Should we try to enable timeline semaphores if available
+ 	bool timeline_semaphore;
+ 
++	//! Should we try to enable the shader int16 feature if available
++	bool shader_int16;
++
+ 	//! Vulkan physical device to be selected, -1 for auto.
+ 	int selected_gpu_index;
+ 
+-- 
+2.43.0
+

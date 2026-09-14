@@ -340,6 +340,8 @@ void settings_streaming(const settings_context & ctx)
 				return _C("Codec", "AV1");
 			case wivrn::raw:
 				break;
+			case wivrn::pyrowave:
+				return _C("Codec", "PyroWave");
 		}
 		return _C("Codec", "Automatic");
 	};

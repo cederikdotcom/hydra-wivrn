@@ -335,6 +335,7 @@ std::shared_ptr<scenes::stream> scenes::stream::create(std::unique_ptr<wivrn_ses
 			{
 				case h264:
 				case raw:
+				case pyrowave:
 					break;
 				case h265:
 				case av1:
@@ -618,7 +619,8 @@ void scenes::stream::push_blit_handle(shard_accumulator * decoder, std::shared_p
 		{
 			if (decoder != decoders[stream].decoder.get())
 				return;
-			handle->feedback.received_from_decoder = instance.now();
+			if (handle->feedback.received_from_decoder == 0)
+				handle->feedback.received_from_decoder = instance.now();
 			std::swap(handle, decoders[stream].latest_frames[handle->feedback.frame_index % decoders[stream].latest_frames.size()]);
 		}
 

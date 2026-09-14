@@ -61,6 +61,7 @@ static void split_bitrate(std::array<wivrn::encoder_settings, 3> & encoders, uin
 			case wivrn::h265:
 			case wivrn::av1:
 			case wivrn::raw:
+			case wivrn::pyrowave:
 				break;
 		}
 		encoder.bitrate = w;
@@ -207,6 +208,7 @@ class prober
 			case av1:
 				U_LOG_D("Vulkan video encode for AV1 is not implemented in WiVRn");
 			case raw:
+			case pyrowave:
 				return false;
 		}
 		U_LOG_E("Invalid codec %d", int(codec));
@@ -222,6 +224,9 @@ public:
 	{
 		if (config.codec == video_codec::raw or config.name == encoder_raw)
 			return {encoder_raw, video_codec::raw};
+
+		if (config.codec == video_codec::pyrowave or config.name == encoder_pyrowave)
+			return {encoder_pyrowave, video_codec::pyrowave};
 
 #if WIVRN_USE_NVENC
 		if ((nvidia and config.name.empty()) or config.name == encoder_nvenc)
@@ -290,6 +295,9 @@ std::array<encoder_settings, 3> get_encoder_settings(wivrn::vk_bundle & bundle, 
 		std::tie(dst.encoder_name, dst.codec) = prober.select_encoder(src);
 	}
 
+	if (res[2].encoder_name == encoder_pyrowave)
+		U_LOG_E("Pyrowave is not supported for alpha channel");
+
 	auto width = align(info.stream_eye_width, 64);
 	auto height = align(info.stream_eye_height, 64);
 	// Ensure we don't try to encode too large images (only for left/right, ignore alpha)
@@ -310,7 +318,8 @@ std::array<encoder_settings, 3> get_encoder_settings(wivrn::vk_bundle & bundle, 
 		throw std::runtime_error("invalid bit-depth setting. supported values: 8, 10");
 
 	if (std::ranges::contains(res, video_codec::h264, &encoder_settings::codec) or
-	    std::ranges::contains(res, video_codec::raw, &encoder_settings::codec))
+	    std::ranges::contains(res, video_codec::raw, &encoder_settings::codec) or
+	    std::ranges::contains(res, video_codec::pyrowave, &encoder_settings::codec))
 		bit_depth = 8;
 	else if (not bit_depth)
 		bit_depth = 10;
