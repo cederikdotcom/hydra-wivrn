@@ -45,6 +45,24 @@ Dependencies follow upstream WiVRn exactly. The PyroWave shaders compile at
 build time with glslang; `-DWIVRN_OPTIMIZE_SHADERS=ON` also needs
 spirv-tools.
 
+### Omarchy / Arch server build
+
+`contrib/arch/PKGBUILD` builds the server as a pacman package
+(`makepkg -si` in that directory). For a direct build, install:
+
+```
+pacman -S --needed cmake ninja gcc git glslang spirv-tools vulkan-headers \
+  vulkan-icd-loader vulkan-tools avahi boost eigen ffmpeg nlohmann-json \
+  libpulse pipewire x264 openxr python nasm glib2-devel pkgconf cli11
+```
+
+then run the server cmake commands above with `-DWIVRN_USE_NVENC=OFF`
+(NVENC needs the CUDA toolchain; x264 and pyrowave do not). Validated
+2026-09-14 on the msi1060 test machine (spicy-cactus-76, node-d71b197c,
+Omarchy 4.0.2, GTX 1060). Note for Pascal GPUs such as the 1060: the
+driver reports no `shaderFloat16`, so PyroWave uses its non-fp16 shader
+variants; this costs some GPU time but works.
+
 ## Enable the codec
 
 PyroWave is opt-in. Auto-selection keeps choosing nvenc/vaapi/x264. Select it
