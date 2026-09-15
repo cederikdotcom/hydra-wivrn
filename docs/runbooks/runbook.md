@@ -47,8 +47,36 @@ spirv-tools.
 
 ### Omarchy / Arch server build
 
-`contrib/arch/PKGBUILD` builds the server as a pacman package
-(`makepkg -si` in that directory). For a direct build, install:
+`contrib/arch/PKGBUILD` builds the server as a pacman package. This is the
+supported install on a Hydra body:
+
+```
+makepkg -f --noconfirm            # as a normal user, never root
+sudo pacman -U hydra-wivrn-server-*.pkg.tar.zst
+```
+
+It installs `/usr/bin/wivrn-server`, which is the path hydrabody looks for when
+deciding whether the body can serve the `wivrn` XR driver.
+
+On a body, the server runs from a Hydra-owned user unit rather than by hand,
+the same arrangement Sunshine uses: the packaged binary against a config the
+cluster controls, kept apart from anything the logged-in user configured.
+
+`~/.config/systemd/user/hydra-wivrn.service`:
+
+```
+ExecStart=/usr/bin/wivrn-server -f /var/lib/hydra/wivrn/config/config.json
+```
+
+The `-f` matters. Without it the server merges config from three locations
+including the user's own `~/.config/wivrn/config.json`; with it, only the
+cluster's file is read. Pairing state still lands in the user's config
+directory, which is correct, because it is per-user trust rather than policy.
+
+The unit is deliberately **not enabled at boot**. hydrabody starts and stops it
+when a head is assigned and released, so an idle body serves nothing.
+
+For a direct build without packaging, install:
 
 ```
 pacman -S --needed cmake ninja gcc git glslang spirv-tools vulkan-headers \
