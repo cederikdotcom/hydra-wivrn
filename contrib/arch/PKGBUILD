@@ -26,7 +26,15 @@ pkgver() {
 }
 
 build() {
+  # makepkg's checkout has no usable git description, and the build treats a
+  # missing one as fatal rather than guessing. Pass it explicitly.
+  local desc commit
+  desc=$(cd hydra-wivrn && git describe --tags --always 2>/dev/null || echo "$pkgver")
+  commit=$(cd hydra-wivrn && git rev-parse HEAD)
+
   cmake -S hydra-wivrn -B build -GNinja \
+    -DGIT_DESC="$desc" \
+    -DGIT_COMMIT="$commit" \
     -DCMAKE_BUILD_TYPE=RelWithDebInfo \
     -DCMAKE_INSTALL_PREFIX=/usr \
     -DWIVRN_BUILD_SERVER=ON \
