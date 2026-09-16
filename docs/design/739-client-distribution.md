@@ -1,5 +1,29 @@
 # Issue #739: WiVRn client distribution for headsets
 
+> ## SUPERSEDED IN PART, 2026-09-16
+>
+> The owner ruled after this was written: **we will not release through Meta**,
+> the target platform will probably be **Pico**, and **side-loading is
+> acceptable for now**.
+>
+> That removes the spine of section 3 and most of the rollout: no Meta
+> organisation, no Horizon Managed Services, no private release channel, and no
+> issue split (its justification was a Meta verification call nobody owned).
+>
+> What still stands: the signing and keystore work in section 2, the version and
+> capability reporting in section 5, and the coexistence question in section 4,
+> where the incumbent becomes Pico Business Streaming rather than
+> hydraheadquest. The session-handoff experiment is still the gate.
+>
+> Verified the same day: the WiVRn client already supports Pico as a first-class
+> target (`client/application.cpp` carries pico_neo3, pico4 and pico4s
+> interaction profiles; `client/hmd_traits.cpp` has a Pico branch). The platform
+> change invalidates the delivery channel, not the client.
+>
+> Read this document for sections 2, 4 and 5. Treat section 3 and the rollout as
+> historical. The current position is on issue #739.
+
+
 > **Verified after writing, 2026-09-16.** Two claims in this document were
 > re-checked against the live estate and both held:
 >
